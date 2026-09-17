@@ -32,9 +32,9 @@ docker compose version
 `docker version` should show both Client and Server sections.
 
 For a PC with 16 GB RAM, leave room for Windows and other applications. This
-Compose service has a 7 GB memory limit and uses up to four CPU cores. Docker/WSL
+Compose service has a 9 GB memory limit and uses up to four CPU cores. Docker/WSL
 must have enough memory available for it. Allow several GB of free disk space
-for Docker layers, approximately **2.35 GB of model downloads** (handwriting plus
+for Docker layers, approximately **3.8 GB of model downloads** (handwriting plus
 text-correction model), and your scanned pages.
 
 ### 2. Build and start
@@ -194,7 +194,8 @@ persistent access code private.
 | --- | --- |
 | Cannot connect to Docker daemon / named pipe | Open Docker Desktop, wait for its engine, and check that Linux containers are selected. |
 | Port 8090 already in use | Stop the direct Windows version, or set `LOCALSCRIBE_PORT=8092` in `.env`; then open port 8092. The startup log shows the internal default port, so adjust its URL. |
-| First startup seems slow | Follow `docker compose logs -f`; the model downloads total about 2.35 GB. |
+| First startup seems slow | Follow `docker compose logs -f`; the model downloads total about 3.8 GB. |
+| Every startup takes minutes | Both models load from the bind-mounted `models/` folder, which is slow through WSL. The 2.5 GB correction model dominates. Set `LOCALSCRIBE_CORRECTOR=0` in `.env` if you do not use AI correction. |
 | Access code rejected after restart | Read the latest code from the log, or set a persistent `LOCALSCRIBE_TOKEN` in `.env`. |
 | Model exited / out of memory | Inspect `data/engine.log` and `docker compose logs`; give Docker more memory or use smaller page images. |
 | Poor handwriting recognition | Try better lighting, a straight page, or smaller sections; review all output. More RAM alone does not improve recognition quality. |
@@ -246,10 +247,14 @@ PATH --gpu-layers 99 --mmproj-offload`.
 Two local models run side by side, both served by llama.cpp. HunyuanOCR Q8 with
 its separate vision projector reads the handwriting; it was selected after a
 repeatable CPU comparison against GLM-OCR and DeepSeek-OCR, see `BENCHMARK.md`.
-Qwen2.5-1.5B-Instruct Q4_K_M backs **Fix with local AI**: it never sees the page
+Qwen3-4B-Instruct-2507 Q4_K_M backs **Fix with local AI**: it never sees the page
 image, only the finished transcription, which it repairs as text. Set
-`LOCALSCRIBE_CORRECTOR=0` in `.env` to skip loading it and save about 1.5 GB of
-RAM. Review remains essential, especially for dense full-page cursive.
+`LOCALSCRIBE_CORRECTOR=0` in `.env` to skip loading it and save about 3 GB of
+RAM, or point `LOCALSCRIBE_CORRECTOR_MODEL` at a smaller GGUF in `models/`.
+
+On one real page, AI correction took the word error rate from 8.1% to 6.4%, while
+in the same pass inventing two words that were not on the page. It is a review aid,
+not a proofreader. Review remains essential, especially for dense full-page cursive.
 
 Implemented: image/PDF upload, queue and queued-job cancellation, dense-page
 segmentation, per-word model confidence highlighted in both the text and the

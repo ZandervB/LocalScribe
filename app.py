@@ -2,12 +2,14 @@
 import base64
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
+import difflib
 from io import BytesIO
 import json
 import math
 import os
 from pathlib import Path
 import queue
+import re
 import secrets
 import sqlite3
 import threading
@@ -249,7 +251,17 @@ class LocalEngine(ChatClient):
 
     def transcribe(self, image_path):
         """Returns the text, whether it was cut short, and the model's own per-token scores."""
-        return self._infer(image_path, "OCR", logprobs=True)
+        text, truncated, scored = self._infer(image_path, "OCR", logprobs=True)
+        return strip_preamble(text), truncated, scored
+
+
+PREAMBLE = re.compile(r"^.{0,120}?(ocr|text in the image|transcription|extracted text).{0,60}:\s*\n+", re.IGNORECASE)
+
+
+def strip_preamble(text):
+    """Drop the chat sentence the OCR model sometimes writes before the page itself."""
+    without = PREAMBLE.sub("", text, count=1)
+    return without.strip() or text
 
 
 UNCERTAIN_PROBABILITY = 0.65
@@ -349,19 +361,26 @@ def map_lines_to_bands(text, bands, first_band):
 
 
 CORRECTOR_SYSTEM = (
-    "You repair transcriptions produced by a handwriting-recognition model. "
-    "The words are real; only the reading of them may be wrong. "
-    "You reply with the corrected transcription and nothing else."
+    "You repair transcriptions produced by a handwriting-recognition model reading a "
+    "handwritten page. The words on the page are real words; only the machine's reading "
+    "of them may be wrong. You reply with the corrected transcription and nothing else."
 )
-CORRECTOR_RULES = """Correct the handwriting-OCR transcription below.
+CORRECTOR_RULES = """Correct this handwriting-OCR transcription.
+
+The recognition model misreads handwriting, so expect real mistakes: wrong letters,
+merged or split words, missing spaces, confusions such as rn/m, l/1, O/0, c/e, i/e,
+b/h and f/s, and broken punctuation. Work out what each garbled word must have been
+from the rest of the page - its subject, vocabulary, names and style - and repair it.
 
 Rules:
-- Use the whole page - its subject, vocabulary, names and style - to work out what a garbled word must have been.
-- Fix only recognition mistakes: wrong letters, merged or split words, missing spaces, confusions such as rn/m, l/1, O/0, c/e, and broken punctuation.
-- Keep the writer's own wording, spelling, abbreviations, capitalisation and line breaks. Do not translate, rephrase, summarise, reorder or add anything.
-- Never invent content. If a word cannot be resolved with confidence, repeat it exactly as it is.
+- Keep the writer's own wording, spelling, abbreviations and capitalisation. Do not translate, rephrase, summarise, reorder or add anything.
+- Never invent content. Where you genuinely cannot tell what a word was, leave it exactly as it is rather than guessing.
 - Leave names, numbers, dates and amounts alone unless the page itself makes the correct reading obvious.
 - Reply with the corrected text only: no commentary, no headings, no code fences."""
+CORRECTOR_HINT = """
+The recognition model scored these words as unlikely, so they are where the mistakes
+probably are. Words not listed were read confidently:
+"""
 
 
 def corrector_sections(text, limit=CORRECTOR_SECTION_CHARS):
@@ -396,7 +415,43 @@ def clean_correction(text):
             lines.pop()
     if lines and lines[0].rstrip(":").strip().lower() in ("corrected text", "corrected transcription", "correction"):
         lines = lines[1:]
-    return "\n".join(lines).strip()
+    return "\n".join(line.rstrip() for line in lines).strip()
+
+
+def refit_lines(draft, corrected):
+    """Put the corrected words back on the page's own lines.
+
+    Models reflow text - they join a word split across two lines, or rewrap a
+    paragraph - which would break the line-by-line comparison against the scan.
+    Aligning the corrected words to the draft's words restores the original
+    layout without discarding the corrections themselves.
+    """
+    source = draft.split("\n")
+    words, line_of = [], []
+    for index, line in enumerate(source):
+        for word in line.split():
+            words.append(word)
+            line_of.append(index)
+    produced = corrected.split()
+    if not produced:
+        return draft
+    if not words or len(words) * len(produced) > 400_000:
+        return corrected
+    buckets = [[] for _ in source]
+    current = line_of[0]
+    for tag, start, end, other_start, other_end in difflib.SequenceMatcher(
+            None, words, produced, autojunk=False).get_opcodes():
+        if tag == "equal":
+            for offset in range(end - start):
+                current = line_of[start + offset]
+                buckets[current].append(produced[other_start + offset])
+            continue
+        for offset, word in enumerate(produced[other_start:other_end]):
+            index = min(start + offset, end - 1) if end > start else start - 1
+            if 0 <= index < len(line_of):
+                current = line_of[index]
+            buckets[current].append(word)
+    return "\n".join(" ".join(bucket) or line for bucket, line in zip(buckets, source))
 
 
 class TextCorrector(ChatClient):
@@ -406,7 +461,7 @@ class TextCorrector(ChatClient):
         super().__init__(port, key, "data/corrector.log")
         self.model = model
 
-    def correct(self, draft):
+    def correct(self, draft, doubted=()):
         draft = draft.strip()
         if not draft:
             raise RuntimeError("There is no transcription to correct yet.")
@@ -415,10 +470,13 @@ class TextCorrector(ChatClient):
         results = []
         for index, section in enumerate(sections, start=1):
             prompt = CORRECTOR_RULES
+            words = [word for word in dict.fromkeys(doubted) if word in section]
+            if words:
+                prompt += "\n" + CORRECTOR_HINT + ", ".join(words[:60])
             if len(sections) > 1:
                 prompt += (f"\n\nWhole page, for context only - do not reply with it:\n\n{page}"
-                           f"\n\nSection {index} of {len(sections)}, the part to correct now:")
-            prompt += f"\n\n{section}"
+                           f"\n\nSection {index} of {len(sections)} is the part to correct now.")
+            prompt += f"\n\nTranscription to correct, and the only thing to reply with:\n\n{section}"
             text, truncated, _ = self.complete(
                 [{"role": "system", "content": CORRECTOR_SYSTEM}, {"role": "user", "content": prompt}],
                 min(4096, len(section) // 2 + 600))
@@ -427,7 +485,7 @@ class TextCorrector(ChatClient):
             corrected = clean_correction(text)
             if not 0.6 <= len(corrected) / max(len(section), 1) <= 1.6:
                 raise RuntimeError("The correction differed too much from the transcription to be trusted, so it was discarded. The original OCR is unchanged.")
-            results.append(corrected)
+            results.append(refit_lines(section, corrected))
         return "\n\n".join(results)
 
 
@@ -467,7 +525,8 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None):
                     note = store.get(note_id)
                     if corrector is None:
                         raise RuntimeError("The local correction model is not running. Start LocalScribe without --no-corrector to use AI correction.")
-                    enhanced = corrector.correct(note["raw_text"])
+                    enhanced = corrector.correct(note["raw_text"],
+                                                 [span["text"] for span in note["uncertain"]])
                     with store.connect() as db:
                         db.execute("""UPDATE notes SET enhanced_text=?,enhance_status='ready',
                             enhance_error='' WHERE id=?""", (enhanced, note_id))

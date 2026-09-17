@@ -18,7 +18,7 @@ services:
       LOCALSCRIBE_TOKEN: "${LOCALSCRIBE_TOKEN:-}"
       LOCALSCRIBE_CORRECTOR: "${LOCALSCRIBE_CORRECTOR:-1}"
       LOCALSCRIBE_CORRECTOR_MODEL: "${LOCALSCRIBE_CORRECTOR_MODEL:-}"
-    mem_limit: 7g
+    mem_limit: 9g
     cpus: 4
     stop_grace_period: 30s
     restart: unless-stopped

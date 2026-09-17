@@ -20,14 +20,18 @@ an NVIDIA GPU a requirement.
 
 Project root: `C:\PROJECTS\TOOLS\LocalScribe`
 
-The CPU container was running and healthy on `127.0.0.1:8090` before the latest
-source-only changes. **The latest sidebar/document-dialog/group-card/full-page
-re-read changes have not been rebuilt into Docker.** The user explicitly stopped
-the implementation pass and asked for documentation only, so the next AI must
-build/recreate the service before expecting those controls in the browser. Do not
-record or reuse an ephemeral access token here; obtain the current one from
-`docker compose logs --tail 30 localscribe` after deployment. The CUDA image is
-configured but has not been built or tested.
+The CPU container has been rebuilt and is running with **both** models: HunyuanOCR
+for recognition and Qwen3-4B-Instruct-2507 for text correction. Everything in this
+document has been exercised against the running container, including a scored run
+on a real user page (see `BENCHMARK.md`). Do not record or reuse an ephemeral
+access token here; obtain the current one from
+`docker compose logs --tail 30 localscribe`. The CUDA image is configured but has
+not been built or tested.
+
+Not verified in a real browser: the uncertainty overlay and the edit/AI-corrected/
+compare tabs were checked by static ID/class cross-reference and one user
+screenshot of the compare view, not by browser automation. The browser tool was
+unavailable in that session.
 
 The previous healthy deployment used:
 
@@ -40,9 +44,8 @@ The last launch URL contained an ephemeral access token. Do **not** reuse or exp
 that old token; read the current token from `docker compose logs --tail 30
 localscribe` if the user asks to open the app.
 
-The previously deployed CPU image is usable but does not contain the final pending
-source changes. The CUDA image is intentionally not built yet; it should be built
-and tested on the target 1050 Ti/1060 device.
+The CUDA image is intentionally not built yet; it should be built and tested on the
+target 1050 Ti/1060 device.
 
 ## Important files
 
@@ -57,7 +60,7 @@ and tested on the target 1050 Ti/1060 device.
 | `app.py` | FastAPI app, SQLite storage, one-item worker queue, both local model clients, uncertainty/ink-line analysis, authenticated routes. |
 | `static/index.html`, `static/style.css`, `static/review.css`, `static/app.js` | Browser interface, including the uncertainty overlay and the edit/AI-corrected/compare tabs. |
 | `setup_model.py` | Native Windows setup and verified model/sample downloads. |
-| `test_app.py` | Twenty-four focused backend tests covering the OCR prompt and logprob request, per-word uncertainty and ink-line mapping, the text corrector's prompt/guardrails/absence, PDF/segmentation, grouping/export/append/whole-group deletion, cancellation, note deletion, correction isolation, and existing safety behavior. |
+| `test_app.py` | Twenty-six focused backend tests covering the OCR prompt and logprob request, per-word uncertainty and ink-line mapping, the text corrector's prompt/guardrails/absence, PDF/segmentation, grouping/export/append/whole-group deletion, cancellation, note deletion, correction isolation, and existing safety behavior. |
 | `benchmark_htr.py`, `benchmark_mtmd_cli.py` | Reproducible CPU handwriting model comparisons. |
 | `render_private_pdf.py`, `qualitative_ocr.py` | Local-only private PDF rendering and qualitative OCR helpers. |
 | `smoke_check.py` | End-to-end check against a running real model; creates a temporary sample note. |
@@ -67,8 +70,8 @@ and tested on the target 1050 Ti/1060 device.
 ## Architecture and intentional choices
 
 - Model: HunyuanOCR Q8 plus Q8 vision projector from `ggml-org/HunyuanOCR-GGUF`, pinned by revision and SHA-256 in `setup_model.py`. It replaced GLM after the CPU benchmark documented in `BENCHMARK.md`.
-- Second model: `Qwen2.5-1.5B-Instruct Q4_K_M` from the official `Qwen/Qwen2.5-1.5B-Instruct-GGUF`
-  repo, pinned the same way, served by a second `llama-server` on its own random
+- Second model: `Qwen3-4B-Instruct-2507 Q4_K_M` (Apache-2.0) from `unsloth/Qwen3-4B-Instruct-2507-GGUF`,
+  pinned by revision and SHA-256 the same way, served by a second `llama-server` on its own random
   loopback port with its own API key. It is text-only and backs **Fix with local
   AI**. It receives the finished OCR text, never the page image. `run.py
   --no-corrector` or `LOCALSCRIBE_CORRECTOR=0` skips it; the app then reports
@@ -119,7 +122,7 @@ Read `BENCHMARK.md` before making claims about quality or performance.
 - Native Windows CPU: difficult public Darwin letter (624 × 1008) processed in 65.593 seconds; model made obvious cursive errors.
 - Docker offline test: the same page processed in 52.924 seconds inside a separate `--network none` container, with read-only models/samples and no user-data mount.
 - Docker smoke test passed authenticated access, actual OCR, save/edit, raw-text preservation, original download, search, and `.txt` export.
-- App test suite passed 24 tests. Run:
+- App test suite passed 26 tests. Run:
 
   ```powershell
   .\.venv\Scripts\python.exe -m unittest -v
@@ -168,15 +171,18 @@ Read `BENCHMARK.md` before making claims about quality or performance.
 11. **PDF pages are rendered images.** Each PDF page's downloadable “original” is
     the rendered JPEG page, not the source PDF file. The source PDF is not retained
     in the notebook database.
-12. **AI correction is a separate text model, and it is small.** HunyuanOCR only
-    behaves reliably with its exact `OCR` instruction: an earlier attempt to make
-    it correct its own draft repeated output until the token limit, and a plain
-    second OCR pass ignored the draft entirely. Correction now runs on
-    Qwen2.5-1.5B-Instruct, which reads the whole transcription as text. A 1.5B
-    model at Q4 is weak; the prompt forbids rewriting, `temperature` is 0, and
-    `TextCorrector.correct` discards any result whose length falls outside
-    0.6-1.6x the input rather than storing a summary or a hallucination. It still
-    cannot know what the page actually said, so the UI never applies it silently.
+12. **AI correction is a separate text model, and it does invent things.**
+    HunyuanOCR only behaves reliably with its exact `OCR` instruction: an earlier
+    attempt to make it correct its own draft repeated output until the token limit,
+    and a plain second OCR pass ignored the draft entirely. Correction now runs on
+    Qwen3-4B-Instruct-2507, which reads the whole transcription as text plus the
+    list of low-confidence words. Measured on a real user page it took word error
+    rate from 8.1% to 6.4%, but in the same run it turned `roes` into `flesh` and
+    appended `the bank`, which is not on the page. `temperature` is 0,
+    `TextCorrector.correct` discards any result whose length falls outside 0.6-1.6x
+    the input, and `refit_lines` forces the reply back onto the page's own lines.
+    None of that can stop a plausible wrong word, so the UI never applies it
+    silently. Do not change that.
 13. **Important fixed regression:** Hunyuan must receive the exact `OCR` prompt
     for transcription. The old GLM-style `Text Recognition:` prompt caused image
     descriptions instead of verbatim OCR. A regression test now asserts `OCR`.

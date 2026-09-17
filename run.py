@@ -105,7 +105,8 @@ def main():
             sys.exit(failure)
         if corrector:
             print("Loading the local correction model...", flush=True)
-            failure = wait_for(corrector, "correction", corrector_process, data / "corrector.log")
+            # A multi-gigabyte text model loads slowly from a bind-mounted folder.
+            failure = wait_for(corrector, "correction", corrector_process, data / "corrector.log", 900)
             if failure:
                 # Transcription is the core feature; AI correction is optional.
                 print(f"{failure}\nContinuing without AI correction.", flush=True)

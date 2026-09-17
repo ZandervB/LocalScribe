@@ -11,7 +11,7 @@ from PIL import Image
 import pymupdf
 
 from app import (clean_correction, corrector_sections, create_app, line_bands, LocalEngine,
-                 map_lines_to_bands, Store, TextCorrector, uncertain_spans)
+                 map_lines_to_bands, refit_lines, Store, strip_preamble, TextCorrector, uncertain_spans)
 
 
 class FakeEngine:
@@ -44,12 +44,14 @@ class FakeCorrector:
 
     def __init__(self):
         self.drafts = []
+        self.doubted = []
 
     def ready(self):
         return True
 
-    def correct(self, draft):
+    def correct(self, draft, doubted=()):
         self.drafts.append(draft)
+        self.doubted.append(list(doubted))
         return draft.replace("Jane", "June")
 
 
@@ -299,6 +301,7 @@ class NotebookTests(unittest.TestCase):
         self.assertIn("June", enhanced["enhanced_text"])
         self.assertEqual(enhanced["text"], original["text"])
         self.assertEqual(self.corrector.drafts, [original["raw_text"]])
+        self.assertEqual(self.corrector.doubted, [["Jane"]])
 
     def test_ai_correction_is_unavailable_without_a_text_model(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -332,6 +335,17 @@ class NotebookTests(unittest.TestCase):
         self.assertIn(draft, prompt)
         self.assertEqual(corrector.client.payloads[0]["temperature"], 0)
 
+    def test_reflowed_correction_is_put_back_on_the_page_lines(self):
+        draft = "gelatin all agree in keep asi by dis=\nsolved by the secretion, but more of them"
+        reflowed = "gelatin all agree in keeping as by dissolved by the secretion, but none of them"
+        fitted = refit_lines(draft, reflowed)
+        self.assertEqual(len(fitted.split("\n")), 2)
+        self.assertTrue(fitted.startswith("gelatin all agree in keeping as by"))
+        self.assertTrue(fitted.split("\n")[1].endswith("but none of them"))
+        blank = "first line\n\nlast line"
+        self.assertEqual(refit_lines(blank, "first line\n\nlast line"), blank)
+        self.assertEqual(refit_lines("kept as is", ""), "kept as is")
+
     def test_corrector_discards_a_rewrite_that_diverges_from_the_transcription(self):
         class JsonResponse(BytesIO):
             def __enter__(self): return self
@@ -363,6 +377,16 @@ class NotebookTests(unittest.TestCase):
         span = note["uncertain"][0]
         self.assertEqual(note["raw_text"][span["start"]:span["end"]], "Jane")
         self.assertIsNone(span["line"])
+
+    def test_chat_preamble_is_removed_so_it_cannot_shift_the_scan_highlights(self):
+        page = "I have told this to a few people\nnever will again, but one day"
+        for preamble in ("Here are the OCR - results of the text in the image:\n\n",
+                         "The text in the image reads:\n",
+                         "Transcription:\n\n"):
+            self.assertEqual(strip_preamble(preamble + page), page)
+        self.assertEqual(strip_preamble(page), page)
+        self.assertEqual(strip_preamble("Notes: buy milk\nand eggs"), "Notes: buy milk\nand eggs")
+        self.assertEqual(strip_preamble("Transcription:\n\n"), "Transcription:\n\n")
 
     def test_uncertainty_ignores_scores_that_do_not_match_the_text(self):
         self.assertEqual(uncertain_spans("Call Jane", [("something", 0.1)]), [])

@@ -77,20 +77,64 @@ position is not estimated; the marker spans the page width.
 ## Local AI text correction (17 September 2026)
 
 Correction no longer re-runs OCR. A second `llama-server` holds a text-only
-instruction model that receives the finished transcription. End-to-end in the
-container, the Darwin page transcribed in **38.1 s** and Qwen2.5-1.5B-Instruct
-Q4_K_M corrected it in **12.2 s**, with `raw_text` and the editor text unchanged.
+instruction model that receives the finished transcription, plus the list of words
+the recognition model scored as unlikely.
 
-Its output on that page was almost empty: `Octg. 74` to `Oct. 74` and nothing else.
-Passing it the list of low-confidence words made it worse, not better - it dropped
-a line and shifted the remainder. A 1.5B model at Q4 is too weak to recover words
-like `selatin` or `carli lopi` on this page. Refusing to guess is the correct
-failure mode, and the length guard in `TextCorrector.correct` exists for the other
-one, but a near-empty result is a weak feature.
+### Choosing the model
+
+Qwen2.5-1.5B-Instruct Q4_K_M was tried first. On the Darwin page it changed exactly
+one thing, `Octg. 74` to `Oct. 74`, and passing it the low-confidence words made it
+worse: it dropped a line and shifted the remainder. A 1.5B model at Q4 is too weak
+for this. Qwen3-4B-Instruct-2507 Q4_K_M (Apache-2.0, 2.5 GB) replaced it and does
+repair words, so it is the default. `LOCALSCRIBE_CORRECTOR_MODEL` still accepts a
+smaller GGUF, and `LOCALSCRIBE_CORRECTOR=0` skips the model entirely.
+
+### Measured on a real page
+
+A modern cursive page written by the user, photographed with both side margins
+cropped and a pen lying across the right of the frame, scored against the
+transcript they supplied. Word error rate is computed on lowercased word tokens.
+
+| Stage | Word error rate |
+| --- | ---: |
+| HunyuanOCR alone | 8.1% |
+| After AI correction | **6.4%** |
+
+That is a 1.7 point absolute, roughly 21% relative, reduction. OCR took 87.7 s and
+correction 57.7 s on four CPU threads. 21 of about 180 words were flagged as
+uncertain, and 22 lines of ink were detected.
+
+The corrections were not uniformly right. `pelump` to `plump`, `he mother` to
+`the mother`, and `wh` to `who` are correct. `roses` to `flesh` is wrong, where the
+page reads `roes`, and the model appended `the bank`, which is not on the page.
+This is why the corrected text is stored separately, shown as a word-level diff,
+and never applied without the user pressing a button.
+
+### Prompt and structure findings
+
+- Asking for numbered output (`7| text`) preserved line structure perfectly but
+  suppressed corrections almost entirely: the model returned the input unchanged.
+- Free-form output corrects well but reflows the page, joining words split across
+  lines with `=`. `refit_lines` now realigns the corrected words onto the draft's
+  own lines with `difflib`, which keeps both the corrections and the layout. Verified
+  on the Darwin page: 16 lines in, 16 out, with a merged line correctly re-split.
+- The low-confidence word list only helps once structure is enforced. Before
+  `refit_lines`, it caused line drift; after, it is what makes the model act.
+- The correction prompt needs an explicit "Transcription to correct, and the only
+  thing to reply with:" label, or the model echoes the instructions back as output
+  and the length guard rejects the whole result.
+
+### An OCR-side bug this exposed
+
+HunyuanOCR sometimes prefixes its answer with a chat sentence such as
+`Here are the OCR - results of the text in the image:`. That line entered the saved
+transcript and, because scan positions are mapped per text line, pushed every
+highlight on the page down by one line. `strip_preamble` removes it in
+`LocalEngine.transcribe`, before offsets are computed.
 
 ## Application checks
 
-Twenty-four automated tests passed: authenticated access, upload/edit/export with raw
+Twenty-six automated tests passed: authenticated access, upload/edit/export with raw
 text and original preservation, optimistic edit concurrency, malformed images,
 failed-job retry, truncated-output flags, interrupted-job recovery, and phone
 EXIF orientation, plus the Hunyuan prompt and logprob-request regression, per-word
