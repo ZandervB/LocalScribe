@@ -16,7 +16,9 @@ services:
       LOCALSCRIBE_MMPROJ_OFFLOAD: "${LOCALSCRIBE_MMPROJ_OFFLOAD:-0}"
       LOCALSCRIBE_OFFLINE: "${LOCALSCRIBE_OFFLINE:-0}"
       LOCALSCRIBE_TOKEN: "${LOCALSCRIBE_TOKEN:-}"
-    mem_limit: 6g
+      LOCALSCRIBE_CORRECTOR: "${LOCALSCRIBE_CORRECTOR:-1}"
+      LOCALSCRIBE_CORRECTOR_MODEL: "${LOCALSCRIBE_CORRECTOR_MODEL:-}"
+    mem_limit: 7g
     cpus: 4
     stop_grace_period: 30s
     restart: unless-stopped

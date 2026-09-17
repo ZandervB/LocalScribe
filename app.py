@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from io import BytesIO
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -30,7 +31,6 @@ MAX_PDF_PAGES = 50
 PDF_DPI = 160
 Image.MAX_IMAGE_PIXELS = 25_000_000
 FORMATS = {"JPEG": (".jpg", "image/jpeg"), "PNG": (".png", "image/png"), "WEBP": (".webp", "image/webp")}
-CORRECTOR_MODEL = "Qwen2.5-1.5B-Instruct Q4_K_M"
 CORRECTOR_SECTION_CHARS = 4500
 CORRECTOR_CONTEXT_CHARS = 9000
 
@@ -61,7 +61,9 @@ class Store:
                 page_number INTEGER,
                 enhanced_text TEXT NOT NULL DEFAULT '',
                 enhance_status TEXT NOT NULL DEFAULT 'idle',
-                enhance_error TEXT NOT NULL DEFAULT ''
+                enhance_error TEXT NOT NULL DEFAULT '',
+                uncertain TEXT NOT NULL DEFAULT '[]',
+                lines TEXT NOT NULL DEFAULT '[]'
             )""")
             columns = {row["name"] for row in db.execute("PRAGMA table_info(notes)")}
             migrations = {
@@ -73,6 +75,8 @@ class Store:
                 "enhanced_text": "ALTER TABLE notes ADD COLUMN enhanced_text TEXT NOT NULL DEFAULT ''",
                 "enhance_status": "ALTER TABLE notes ADD COLUMN enhance_status TEXT NOT NULL DEFAULT 'idle'",
                 "enhance_error": "ALTER TABLE notes ADD COLUMN enhance_error TEXT NOT NULL DEFAULT ''",
+                "uncertain": "ALTER TABLE notes ADD COLUMN uncertain TEXT NOT NULL DEFAULT '[]'",
+                "lines": "ALTER TABLE notes ADD COLUMN lines TEXT NOT NULL DEFAULT '[]'",
             }
             for column, statement in migrations.items():
                 if column not in columns:
@@ -98,10 +102,11 @@ class Store:
         if not row:
             raise HTTPException(404, "Note not found")
         note = dict(row)
-        try:
-            note["regions"] = json.loads(note.get("regions") or "[]")
-        except json.JSONDecodeError:
-            note["regions"] = []
+        for field in ("regions", "uncertain", "lines"):
+            try:
+                note[field] = json.loads(note.get(field) or "[]")
+            except json.JSONDecodeError:
+                note[field] = []
         return note
 
     def add(self, content, filename, segment=True, document_id="", document_title="", page_number=None):
@@ -209,8 +214,10 @@ class ChatClient:
         except (OSError, urllib.error.URLError):
             return False
 
-    def complete(self, messages, max_tokens):
+    def complete(self, messages, max_tokens, logprobs=False):
         payload = {"messages": messages, "temperature": 0, "max_tokens": max_tokens, "stream": False}
+        if logprobs:
+            payload["logprobs"] = True
         request = urllib.request.Request(self.url + "/v1/chat/completions",
                                          data=json.dumps(payload).encode(),
                                          headers={**self.headers, "Content-Type": "application/json"})
@@ -223,22 +230,122 @@ class ChatClient:
         text = choice["message"].get("content")
         if not isinstance(text, str) or not text.strip():
             raise RuntimeError("No text was returned. Try a clearer photo or a smaller section of the page.")
-        return text.strip(), choice.get("finish_reason") == "length"
+        scored = [(item.get("token", ""), math.exp(item["logprob"]))
+                  for item in ((choice.get("logprobs") or {}).get("content") or [])
+                  if isinstance(item.get("logprob"), (int, float))]
+        return text.strip(), choice.get("finish_reason") == "length", scored
 
 
 class LocalEngine(ChatClient):
     def __init__(self, port=8091, key=""):
         super().__init__(port, key, "data/engine.log")
 
-    def _infer(self, image_path, prompt, max_tokens=2048):
+    def _infer(self, image_path, prompt, max_tokens=2048, logprobs=False):
         encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
         return self.complete([{"role": "user", "content": [
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + encoded}},
-        ]}], max_tokens)
+        ]}], max_tokens, logprobs)
 
     def transcribe(self, image_path):
-        return self._infer(image_path, "OCR")
+        """Returns the text, whether it was cut short, and the model's own per-token scores."""
+        return self._infer(image_path, "OCR", logprobs=True)
+
+
+UNCERTAIN_PROBABILITY = 0.65
+
+
+def uncertain_spans(text, scored, minimum=UNCERTAIN_PROBABILITY):
+    """Whole words whose tokens the recognition model itself scored as unlikely."""
+    joined = "".join(token for token, _ in scored)
+    offset = joined.find(text)
+    if not scored or offset < 0:
+        return []
+    spans, position = [], -offset
+    for token, probability in scored:
+        start, position = position, position + len(token)
+        if probability >= minimum or position <= 0 or start >= len(text):
+            continue
+        low, high = max(start, 0), min(position, len(text))
+        while low < high and text[low].isspace():
+            low += 1
+        while high > low and text[high - 1].isspace():
+            high -= 1
+        if low >= high:
+            continue
+        while low > 0 and not text[low - 1].isspace():
+            low -= 1
+        while high < len(text) and not text[high].isspace():
+            high += 1
+        if not any(character.isalnum() for character in text[low:high]):
+            continue
+        if spans and low <= spans[-1]["end"]:
+            spans[-1]["end"] = max(spans[-1]["end"], high)
+            spans[-1]["text"] = text[spans[-1]["start"]:spans[-1]["end"]]
+            spans[-1]["p"] = min(spans[-1]["p"], round(probability, 3))
+            continue
+        spans.append({"start": low, "end": high, "text": text[low:high], "p": round(probability, 3)})
+    return spans
+
+
+def ink_lines(image, floor=0.16, gap=2):
+    """Rows of ink in a page image, as (top, bottom) pixel pairs."""
+    # Photographed pages carry a dark frame; profiling the inside avoids reading it as a line.
+    inset = max(2, round(min(image.width, image.height) * 0.02))
+    if image.width <= 2 * inset or image.height <= 2 * inset:
+        return []
+    inside = image.convert("L").crop((inset, inset, image.width - inset, image.height - inset))
+    column = inside.resize((1, inside.height), Image.Resampling.BOX)
+    profile = [255 - column.getpixel((0, row)) for row in range(inside.height)]
+    page = min(profile)
+    peak = max(profile) - page
+    if peak < 6:
+        return []
+    inked = [value - page > peak * floor for value in profile]
+    lines, start, quiet = [], None, 0
+    for row, on in enumerate(inked + [False] * (gap + 1)):
+        if on:
+            start, quiet = (row if start is None else start), 0
+        elif start is not None:
+            quiet += 1
+            if quiet > gap:
+                if row - quiet - start >= 3:
+                    lines.append((start + inset, row - quiet + inset))
+                start = None
+    return lines
+
+
+def line_bands(image, top, bottom):
+    """Detected text lines of one segment, as fractions of the whole page."""
+    height = image.height or 1
+    span = bottom - top
+    return [{"top": top + (first / height) * span, "bottom": top + (last / height) * span}
+            for first, last in ink_lines(image)]
+
+
+def text_rows(text):
+    return [index for index, line in enumerate(text.split("\n")) if line.strip()]
+
+
+def map_lines_to_bands(text, bands, first_band):
+    """Estimate which detected band of ink each text line came from.
+
+    The recognition model gives no coordinates, so each line is placed
+    proportionally down the written area and snapped to the nearest band. A scan
+    can hold marks the model never transcribed, so this is a pointer for review
+    rather than a measured position.
+    """
+    rows = text_rows(text)
+    if not bands or not rows:
+        return {}
+    first, last = bands[0]["top"], bands[-1]["bottom"]
+    centres = [(band["top"] + band["bottom"]) / 2 for band in bands]
+    mapping = {}
+    for position, row in enumerate(rows):
+        estimate = first + (last - first) * (position + 0.5) / len(rows)
+        nearest = min(range(len(centres)), key=lambda index: abs(centres[index] - estimate))
+        mapping[row] = first_band + nearest
+    return mapping
 
 
 CORRECTOR_SYSTEM = (
@@ -259,8 +366,16 @@ Rules:
 
 def corrector_sections(text, limit=CORRECTOR_SECTION_CHARS):
     """Split a long page on blank lines so each request fits the model's context."""
-    sections, current = [], ""
+    blocks = []
     for block in text.split("\n\n"):
+        while len(block) > limit:
+            cut = block.rfind("\n", 0, limit)
+            cut = cut if cut > limit // 2 else limit
+            blocks.append(block[:cut])
+            block = block[cut:].lstrip("\n")
+        blocks.append(block)
+    sections, current = [], ""
+    for block in blocks:
         if current and len(current) + len(block) + 2 > limit:
             sections.append(current)
             current = block
@@ -287,10 +402,9 @@ def clean_correction(text):
 class TextCorrector(ChatClient):
     """Instruction-following text model that repairs a finished OCR draft."""
 
-    model = CORRECTOR_MODEL
-
-    def __init__(self, port=8092, key=""):
+    def __init__(self, port=8092, key="", model="the local text model"):
         super().__init__(port, key, "data/corrector.log")
+        self.model = model
 
     def correct(self, draft):
         draft = draft.strip()
@@ -305,7 +419,7 @@ class TextCorrector(ChatClient):
                 prompt += (f"\n\nWhole page, for context only - do not reply with it:\n\n{page}"
                            f"\n\nSection {index} of {len(sections)}, the part to correct now:")
             prompt += f"\n\n{section}"
-            text, truncated = self.complete(
+            text, truncated, _ = self.complete(
                 [{"role": "system", "content": CORRECTOR_SYSTEM}, {"role": "user", "content": prompt}],
                 min(4096, len(section) // 2 + 600))
             if truncated:
@@ -365,22 +479,31 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None):
                         continue
                 start = time.monotonic()
                 note = store.get(note_id)
-                outputs, regions, truncated = [], [], False
+                outputs, regions, lines, uncertain, truncated = [], [], [], [], False
                 with segmented_inputs(store.files / f"{note_id}.preview.jpg", bool(note["segment"])) as inputs:
                     for index, item in enumerate(inputs, start=1):
-                        segment_text, segment_truncated = engine.transcribe(item["path"])
+                        segment_text, segment_truncated, scored = engine.transcribe(item["path"])
                         start_offset = sum(len(output) + 2 for output in outputs)
                         outputs.append(segment_text)
                         regions.append({"index": index, "top": item["top"], "bottom": item["bottom"],
                                         "start": start_offset, "end": start_offset + len(segment_text),
                                         "text": segment_text})
                         truncated = truncated or segment_truncated
+                        with Image.open(item["path"]) as crop:
+                            bands = line_bands(crop, item["top"], item["bottom"])
+                        rows = map_lines_to_bands(segment_text, bands, len(lines))
+                        lines.extend(bands)
+                        for span in uncertain_spans(segment_text, scored):
+                            row = segment_text.count("\n", 0, span["start"])
+                            uncertain.append({**span, "start": span["start"] + start_offset,
+                                              "end": span["end"] + start_offset, "line": rows.get(row)})
                 text = "\n\n".join(outputs)
                 with store.connect() as db:
                     db.execute("""UPDATE notes SET status='ready', raw_text=?, text=?,
-                        seconds=?, truncated=?, regions=?, reviewed=0, revision=revision+1 WHERE id=?""",
+                        seconds=?, truncated=?, regions=?, uncertain=?, lines=?,
+                        reviewed=0, revision=revision+1 WHERE id=?""",
                                (text, text, time.monotonic() - start, int(truncated),
-                                json.dumps(regions), note_id))
+                                json.dumps(regions), json.dumps(uncertain), json.dumps(lines), note_id))
             except Exception as exc:
                 with store.connect() as db:
                     if kind == "enhance":

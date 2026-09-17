@@ -92,8 +92,8 @@ def main():
             zipped.extractall(archive.parent)
     else:
         print("Install llama.cpp for your OS and put llama-server on PATH (or use --engine-path).")
-    for name, sha in MODEL_FILES.items():
-        download(f"https://huggingface.co/ggml-org/HunyuanOCR-GGUF/resolve/{REV}/{name}", ROOT / "models" / name, sha)
+    for name, url, sha in model_downloads():
+        download(url, ROOT / "models" / name, sha)
     if args.sample:
         download_samples()
     print("Setup complete. All transcription can now run offline.")

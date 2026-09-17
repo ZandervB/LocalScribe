@@ -10,7 +10,8 @@ from fastapi.testclient import TestClient
 from PIL import Image
 import pymupdf
 
-from app import create_app, LocalEngine, Store
+from app import (clean_correction, corrector_sections, create_app, line_bands, LocalEngine,
+                 map_lines_to_bands, Store, TextCorrector, uncertain_spans)
 
 
 class FakeEngine:
@@ -33,19 +34,31 @@ class FakeEngine:
             self.gate.wait(timeout=5)
         if self.failure:
             raise RuntimeError("Simulated interruption")
-        return "Meeting notes\nCall Jane at 10:30.", self.truncated
+        scored = [("Meeting", 0.99), (" notes", 0.98), ("\n", 0.99), ("Call", 0.97), (" ", 0.99),
+                  ("Jane", 0.31), (" at", 0.98), (" 10", 0.95), (":", 0.99), ("30", 0.9), (".", 0.99)]
+        return "Meeting notes\nCall Jane at 10:30.", self.truncated, scored
 
-    def enhance(self, path, draft):
-        with Image.open(path) as image:
-            image.verify()
-        return draft.replace("Jane", "June"), False
+
+class FakeCorrector:
+    model = "Fake corrector"
+
+    def __init__(self):
+        self.drafts = []
+
+    def ready(self):
+        return True
+
+    def correct(self, draft):
+        self.drafts.append(draft)
+        return draft.replace("Jane", "June")
 
 
 class NotebookTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.engine = FakeEngine()
-        self.app = create_app(self.directory.name, self.engine, "test-secret")
+        self.corrector = FakeCorrector()
+        self.app = create_app(self.directory.name, self.engine, "test-secret", self.corrector)
         self.client = TestClient(self.app, headers={"Authorization": "Bearer test-secret"})
         self.client.__enter__()
         stream = BytesIO()
@@ -207,11 +220,9 @@ class NotebookTests(unittest.TestCase):
         path.write_bytes(self.image)
         engine = LocalEngine()
         engine.client = CapturingClient()
-        self.assertEqual(engine.transcribe(path), ("Exact text", False))
+        self.assertEqual(engine.transcribe(path), ("Exact text", False, []))
+        self.assertTrue(engine.client.payload["logprobs"])
         self.assertEqual(engine.client.payload["messages"][0]["content"][0]["text"], "OCR")
-        self.assertEqual(engine.enhance(path, "A draft that must not confuse the OCR model"), ("Exact text", False))
-        self.assertEqual(engine.client.payload["messages"][0]["content"][0]["text"], "OCR")
-        self.assertEqual(engine.client.payload["max_tokens"], 4096)
 
     def test_queued_transcription_can_be_cancelled(self):
         self.engine.gate = threading.Event()
@@ -287,6 +298,91 @@ class NotebookTests(unittest.TestCase):
         self.assertIn("Jane", enhanced["raw_text"])
         self.assertIn("June", enhanced["enhanced_text"])
         self.assertEqual(enhanced["text"], original["text"])
+        self.assertEqual(self.corrector.drafts, [original["raw_text"]])
+
+    def test_ai_correction_is_unavailable_without_a_text_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = create_app(directory, FakeEngine(), "test-secret")
+            with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+                self.assertFalse(client.get("/api/status").json()["corrector_ready"])
+                note = client.post("/api/notes", files={"file": ("note.png", self.image, "image/png")}).json()
+                end = time.monotonic() + 5
+                while time.monotonic() < end and client.get("/api/notes/" + note["id"]).json()["status"] != "ready":
+                    time.sleep(0.01)
+                self.assertEqual(client.post(f"/api/notes/{note['id']}/enhance").status_code, 503)
+
+    def test_corrector_sends_the_whole_page_and_strips_model_decoration(self):
+        class JsonResponse(BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *args): self.close()
+
+        class CapturingClient:
+            payloads = []
+            def open(inner_self, request, timeout):
+                inner_self.payloads.append(json.loads(request.data))
+                return JsonResponse(json.dumps({"choices": [{"message": {
+                    "content": "```\nCorrected text:\nMeeting notes\nCall June at 10:30.\n```"},
+                    "finish_reason": "stop"}]}).encode())
+
+        corrector = TextCorrector()
+        corrector.client = CapturingClient()
+        draft = "Meeting notes\nCall Jane at 10:30."
+        self.assertEqual(corrector.correct(draft), "Meeting notes\nCall June at 10:30.")
+        prompt = corrector.client.payloads[0]["messages"][1]["content"]
+        self.assertIn(draft, prompt)
+        self.assertEqual(corrector.client.payloads[0]["temperature"], 0)
+
+    def test_corrector_discards_a_rewrite_that_diverges_from_the_transcription(self):
+        class JsonResponse(BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *args): self.close()
+
+        class RamblingClient:
+            def open(inner_self, request, timeout):
+                return JsonResponse(json.dumps({"choices": [{"message": {
+                    "content": "Here is a summary of the page. " * 40}, "finish_reason": "stop"}]}).encode())
+
+        corrector = TextCorrector()
+        corrector.client = RamblingClient()
+        with self.assertRaises(RuntimeError):
+            corrector.correct("Meeting notes\nCall Jane at 10:30.")
+
+    def test_long_pages_are_split_into_context_sized_sections(self):
+        blocks = ["Paragraph %d %s" % (index, "word " * 100) for index in range(12)]
+        sections = corrector_sections("\n\n".join(blocks), limit=1000)
+        self.assertGreater(len(sections), 1)
+        self.assertTrue(all(len(section) <= 1000 for section in sections))
+        self.assertEqual("\n\n".join(sections), "\n\n".join(blocks))
+        unbroken = corrector_sections("word " * 900, limit=1000)
+        self.assertTrue(all(len(section) <= 1000 for section in unbroken))
+        self.assertEqual(clean_correction("Correction:\nplain text"), "plain text")
+
+    def test_low_confidence_words_are_recorded_against_the_page_text(self):
+        note = self.wait(self.upload())
+        self.assertEqual([(span["text"], span["p"]) for span in note["uncertain"]], [("Jane", 0.31)])
+        span = note["uncertain"][0]
+        self.assertEqual(note["raw_text"][span["start"]:span["end"]], "Jane")
+        self.assertIsNone(span["line"])
+
+    def test_uncertainty_ignores_scores_that_do_not_match_the_text(self):
+        self.assertEqual(uncertain_spans("Call Jane", [("something", 0.1)]), [])
+        self.assertEqual(uncertain_spans("Call Jane", []), [])
+        spans = uncertain_spans("  Call Jane. ".strip(), [("  Call", 0.9), (" Ja", 0.2), ("ne", 0.4), (".", 0.9), (" ", 0.9)])
+        self.assertEqual([(span["text"], span["p"]) for span in spans], [("Jane.", 0.2)])
+
+    def test_detected_ink_lines_locate_words_in_the_scan(self):
+        page = Image.new("L", (200, 300), 255)
+        for top in (40, 120, 200):
+            for row in range(top, top + 18):
+                for column in range(20, 180):
+                    page.putpixel((column, row), 0)
+        bands = line_bands(page, 0.0, 1.0)
+        self.assertEqual(len(bands), 3)
+        self.assertAlmostEqual(bands[0]["top"], 40 / 300, places=2)
+        self.assertAlmostEqual(bands[2]["bottom"], 218 / 300, places=2)
+        self.assertEqual(map_lines_to_bands("one\ntwo\nthree", bands, 0), {0: 0, 1: 1, 2: 2})
+        self.assertEqual(map_lines_to_bands("one\n\ntwo", bands, 5), {0: 5, 2: 7})
+        self.assertEqual(map_lines_to_bands("text", [], 0), {})
 
 
 if __name__ == "__main__":

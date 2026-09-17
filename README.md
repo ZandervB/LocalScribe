@@ -5,7 +5,9 @@ Upload a page, compare the transcription with the scan, make corrections, then
 copy or export it. Originals and the unedited machine transcription are preserved.
 
 This is an early prototype. Difficult cursive can produce wrong words or missing
-lines without an uncertainty warning. Every transcription starts as **Needs review**.
+lines. The words the model itself scored as unlikely are marked for you, but a
+confident-looking word can still be wrong and a dropped line is never flagged.
+Every transcription starts as **Needs review**.
 
 ## Recommended: Docker Desktop
 
@@ -30,9 +32,10 @@ docker compose version
 `docker version` should show both Client and Server sections.
 
 For a PC with 16 GB RAM, leave room for Windows and other applications. This
-Compose service has a 6 GB memory limit and uses up to four CPU cores. Docker/WSL
+Compose service has a 7 GB memory limit and uses up to four CPU cores. Docker/WSL
 must have enough memory available for it. Allow several GB of free disk space
-for Docker layers, an approximately **1.31 GB model download**, and your scanned pages.
+for Docker layers, approximately **2.35 GB of model downloads** (handwriting plus
+text-correction model), and your scanned pages.
 
 ### 2. Build and start
 
@@ -70,12 +73,15 @@ start unless you configure `LOCALSCRIBE_TOKEN` in `.env`.
 2. Wait for transcription. Pages are processed one at a time.
 3. Check the scan beside the editable text and make corrections.
 4. Click **Save changes**, then **Copy text** or **Export .txt**.
-5. Use **Review by page section** to jump between OCR text and its highlighted
-   source band. The “Check carefully” chips call attention to numbers and
-   capitalized terms without pretending they are confidence scores.
-6. Optionally run **Re-read full page**. HunyuanOCR independently reads the full
-   page again and stores that second result separately. Switch between both
-   versions and explicitly choose whether to copy the re-read into the editor.
+5. Words the recognition model scored as unlikely are shaded in the editable text
+   and boxed on the scan beside them. **Next uncertain word** steps through them.
+   These are the model's own per-word scores rather than a guarantee, and the
+   place marked on the scan is estimated from the page layout. **Review by page
+   section** and the older “worth checking” cues sit under the same panel.
+6. Optionally click **Fix with local AI** above the text. A second local model
+   reads the whole transcription and repairs recognition mistakes in it. The
+   **AI corrected** and **Compare** tabs show what changed word by word; you then
+   choose whether to put it in the editor. The original OCR is never overwritten.
 7. Use **Create document** to select existing notes in page order. The dialog can
    create a new document or append pages to an existing one, and its arrow buttons
    adjust page order before saving. Imported PDF pages are grouped automatically.
@@ -188,7 +194,7 @@ persistent access code private.
 | --- | --- |
 | Cannot connect to Docker daemon / named pipe | Open Docker Desktop, wait for its engine, and check that Linux containers are selected. |
 | Port 8090 already in use | Stop the direct Windows version, or set `LOCALSCRIBE_PORT=8092` in `.env`; then open port 8092. The startup log shows the internal default port, so adjust its URL. |
-| First startup seems slow | Follow `docker compose logs -f`; the model download is about 1.31 GB. |
+| First startup seems slow | Follow `docker compose logs -f`; the model downloads total about 2.35 GB. |
 | Access code rejected after restart | Read the latest code from the log, or set a persistent `LOCALSCRIBE_TOKEN` in `.env`. |
 | Model exited / out of memory | Inspect `data/engine.log` and `docker compose logs`; give Docker more memory or use smaller page images. |
 | Poor handwriting recognition | Try better lighting, a straight page, or smaller sections; review all output. More RAM alone does not improve recognition quality. |
@@ -237,21 +243,27 @@ CPU mode with the ordinary `docker compose up --build -d` command. Native Window
 GPU mode requires a CUDA-enabled `llama-server.exe`, then `run.py --engine-path
 PATH --gpu-layers 99 --mmproj-offload`.
 
-The default model is HunyuanOCR Q8 with its separate vision projector, served by
-llama.cpp. It was selected after a repeatable CPU comparison against GLM-OCR and
-DeepSeek-OCR; see `BENCHMARK.md`. Review remains essential, especially for dense
-full-page cursive.
+Two local models run side by side, both served by llama.cpp. HunyuanOCR Q8 with
+its separate vision projector reads the handwriting; it was selected after a
+repeatable CPU comparison against GLM-OCR and DeepSeek-OCR, see `BENCHMARK.md`.
+Qwen2.5-1.5B-Instruct Q4_K_M backs **Fix with local AI**: it never sees the page
+image, only the finished transcription, which it repairs as text. Set
+`LOCALSCRIBE_CORRECTOR=0` in `.env` to skip loading it and save about 1.5 GB of
+RAM. Review remains essential, especially for dense full-page cursive.
 
 Implemented: image/PDF upload, queue and queued-job cancellation, dense-page
-segmentation, section-to-source review navigation, reversible full-page AI re-read,
-side-by-side editing, immutable raw transcription, review flag, search, note
-deletion, document grouping/append/combined export/whole-group deletion, original
-download, access code, and restart recovery.
+segmentation, per-word model confidence highlighted in both the text and the
+scan, section-to-source review navigation, reversible AI text correction with a
+word-level comparison, side-by-side editing, immutable raw transcription, review
+flag, search, note deletion, document grouping/append/combined export/whole-group
+deletion, original download, access code, and restart recovery.
 
-Not yet implemented: renaming/reordering/ungrouping an already-saved document, automatic camera
-edge detection/deskew, genuine per-word model confidence, GPU performance validation on the target device, HTTPS, multiple
-user accounts, and a packaged phone app. CPU-only phones do not run the model;
-they use the PC-hosted web interface.
+Not yet implemented: renaming/reordering/ungrouping an already-saved document,
+automatic camera edge detection/deskew, measured word-level bounding boxes (the
+scan highlight is estimated from detected lines of ink), GPU performance
+validation on the target device, HTTPS, multiple user accounts, and a packaged
+phone app. CPU-only phones do not run the model; they use the PC-hosted web
+interface.
 
 See [BENCHMARK.md](BENCHMARK.md) for measured results and validation limits.
 
@@ -280,5 +292,6 @@ model transcription is tested separately and documented in the benchmark notes.
 
 Upstream software/model licenses continue to apply. Public examples are downloaded
 separately for evaluation; check their source terms before redistributing them.
-#   L o c a l S c r i b e  
+#   L o c a l S c r i b e 
+ 
  

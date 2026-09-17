@@ -53,11 +53,11 @@ and tested on the target 1050 Ti/1060 device.
 | `compose.gpu.yaml` | Opt-in NVIDIA CUDA overlay; uses pinned llama.cpp b11011 CUDA image, `gpus: all`, 99 GPU layers, and vision-projector offload. |
 | `Dockerfile` | Parameterized container based on a digest-pinned official CPU or CUDA llama.cpp server image. `LD_LIBRARY_PATH=/app` is required. |
 | `docker_entry.py` | Downloads missing model files once, verifies SHA-256, then starts local app and local model. |
-| `run.py` | Starts `llama-server`, waits for health, generates/uses access code, starts FastAPI. |
-| `app.py` | FastAPI app, SQLite storage, one-item worker queue, local engine client, authenticated routes. |
-| `static/index.html`, `static/style.css`, `static/app.js` | Browser interface. |
+| `run.py` | Starts both `llama-server` processes (OCR, and the text corrector unless `--no-corrector`), waits for health, generates/uses access code, starts FastAPI. |
+| `app.py` | FastAPI app, SQLite storage, one-item worker queue, both local model clients, uncertainty/ink-line analysis, authenticated routes. |
+| `static/index.html`, `static/style.css`, `static/review.css`, `static/app.js` | Browser interface, including the uncertainty overlay and the edit/AI-corrected/compare tabs. |
 | `setup_model.py` | Native Windows setup and verified model/sample downloads. |
-| `test_app.py` | Seventeen focused backend tests covering OCR/re-read prompts, PDF/segmentation, grouping/export/append/whole-group deletion, cancellation, note deletion, enhancement isolation, and existing safety behavior. |
+| `test_app.py` | Twenty-four focused backend tests covering the OCR prompt and logprob request, per-word uncertainty and ink-line mapping, the text corrector's prompt/guardrails/absence, PDF/segmentation, grouping/export/append/whole-group deletion, cancellation, note deletion, correction isolation, and existing safety behavior. |
 | `benchmark_htr.py`, `benchmark_mtmd_cli.py` | Reproducible CPU handwriting model comparisons. |
 | `render_private_pdf.py`, `qualitative_ocr.py` | Local-only private PDF rendering and qualitative OCR helpers. |
 | `smoke_check.py` | End-to-end check against a running real model; creates a temporary sample note. |
@@ -67,23 +67,42 @@ and tested on the target 1050 Ti/1060 device.
 ## Architecture and intentional choices
 
 - Model: HunyuanOCR Q8 plus Q8 vision projector from `ggml-org/HunyuanOCR-GGUF`, pinned by revision and SHA-256 in `setup_model.py`. It replaced GLM after the CPU benchmark documented in `BENCHMARK.md`.
+- Second model: `Qwen2.5-1.5B-Instruct Q4_K_M` from the official `Qwen/Qwen2.5-1.5B-Instruct-GGUF`
+  repo, pinned the same way, served by a second `llama-server` on its own random
+  loopback port with its own API key. It is text-only and backs **Fix with local
+  AI**. It receives the finished OCR text, never the page image. `run.py
+  --no-corrector` or `LOCALSCRIBE_CORRECTOR=0` skips it; the app then reports
+  `corrector_ready: false` and the endpoint returns 503 instead of failing later.
+- Per-word confidence: `transcribe()` asks llama.cpp for `logprobs` and returns
+  `(text, truncated, [(token, probability), ...])`. `uncertain_spans()` expands
+  every token below `UNCERTAIN_PROBABILITY` (0.65) to its whole word and merges
+  overlaps. This is the recognition model's own score, not a heuristic.
+- Scan localisation: `ink_lines()` takes a one-pixel-wide BOX resize of the
+  segment as a row-ink profile (fast, no numpy) and returns bands of ink, with a
+  2% inset so a photographed page's dark frame is not read as a line.
+  `map_lines_to_bands()` places each text line proportionally down the written
+  area and snaps it to the nearest band. There are no measured word boxes; the
+  UI says so.
 - Runtime: llama.cpp. Docker defaults to a pinned CPU image; `compose.gpu.yaml`
   selects the matching pinned CUDA image. Native Windows setup downloads the
   b11020 CPU executable archive. Native GPU use requires supplying a CUDA-enabled
   `llama-server.exe` to `run.py`.
 - Storage: `data/notes.sqlite3` plus originals/previews under `data/pages/`. These folders are bind-mounted and persist beyond container recreation.
 - Review safety: `raw_text` is never overwritten. `enhanced_text` is a separate,
-  optional full-page AI re-read result. `text` is editable/final and receives
-  enhanced text only after explicit user confirmation. Each note begins unreviewed.
+  optional text-model correction of it. `text` is editable/final and receives
+  corrected text only after explicit user confirmation. Each note begins unreviewed.
 - Privacy: OCR engine binds to `127.0.0.1` inside the container and is never published. Browser API uses a bearer access code. The default Compose binding is `127.0.0.1:8090`.
 - Processing: exactly one worker/job at a time. This deliberately keeps CPU/RAM predictable. CPU is the default; `compose.gpu.yaml` provides an opt-in pinned CUDA runtime with configurable layer and vision-projector offload.
 - Supported inputs: JPEG, PNG, WebP (15 MB / 25 MP), and PDFs (50 MB / 50 pages). Every PDF page is rendered locally at 160 DPI and becomes a separate note. Dense-page segmentation is enabled by default and persisted per note.
 - Segmentation: portrait previews taller than 1200 px and 1.15 times their width
   are divided into 2-4 horizontal bands near low-ink rows. OCR runs top-to-bottom
   and outputs are joined with blank lines. Users can disable this per upload.
-- Guided review: every OCR segment stores normalized page bounds and raw-text
-  offsets. Section buttons highlight the source band and select the corresponding
-  text. Numbers/capitalized terms are heuristic review cues, not confidence.
+- Guided review: the note stores `uncertain` (low-scoring words with page-text
+  offsets, probability, and a line index) and `lines` (normalized bands of ink).
+  The editor shades those words behind the textarea and draws their bands on the
+  scan; **Next uncertain word** steps through them. Every OCR segment also stores
+  normalized page bounds and raw-text offsets for section navigation. The old
+  numbers/capitalized-term cues remain, now labelled as cues rather than scores.
 - Documents: PDF pages share document metadata automatically. Existing notes can
   be selected and reordered before save with **Create document**, then placed in
   a new document or appended to an existing one. Document cards provide combined
@@ -100,7 +119,7 @@ Read `BENCHMARK.md` before making claims about quality or performance.
 - Native Windows CPU: difficult public Darwin letter (624 × 1008) processed in 65.593 seconds; model made obvious cursive errors.
 - Docker offline test: the same page processed in 52.924 seconds inside a separate `--network none` container, with read-only models/samples and no user-data mount.
 - Docker smoke test passed authenticated access, actual OCR, save/edit, raw-text preservation, original download, search, and `.txt` export.
-- App test suite passed 17 tests. Run:
+- App test suite passed 24 tests. Run:
 
   ```powershell
   .\.venv\Scripts\python.exe -m unittest -v
@@ -124,7 +143,15 @@ Read `BENCHMARK.md` before making claims about quality or performance.
 ## Known limitations and bugs to preserve awareness of
 
 1. **Handwriting accuracy is not sufficient to call this production-ready.** The Darwin page had errors such as `Sanderson` becoming `Anderson` and `going to beg` becoming `giving the`. Never silently “fix” uncertain OCR with a language model. Keep original and raw text visible.
-2. **No per-word confidence or image-to-text correspondence.** The UI cannot highlight questionable passages. This is the highest-value product improvement after collecting real user samples.
+2. **Word-level scan positions are estimated, not measured.** Per-word confidence
+   is now genuine (llama.cpp `logprobs`), and low-scoring words are shaded in the
+   editor and boxed on the scan. But the box comes from detected lines of ink plus
+   a proportional text-line-to-band mapping, so a scan holding marks the model
+   never transcribed can shift a line. Measured on the Darwin page: 14 of 15 lines
+   landed on the right handwriting, the first line was one band high because of
+   the scan's dark top border. Horizontal position is not estimated at all - the
+   box spans the full width. Real per-word boxes need a layout detector or a
+   different OCR engine.
 3. **Document groups still use note metadata.** PDF pages group automatically;
    arbitrary notes can be grouped, reordered before creation, appended, exported,
    or deleted as a group. There is no rename, post-save reorder, or ungroup UI.
@@ -141,12 +168,15 @@ Read `BENCHMARK.md` before making claims about quality or performance.
 11. **PDF pages are rendered images.** Each PDF page's downloadable “original” is
     the rendered JPEG page, not the source PDF file. The source PDF is not retained
     in the notebook database.
-12. **The AI re-read is experimental.** HunyuanOCR only behaves reliably with its
-    exact `OCR` instruction. The earlier long correction prompt repeated output
-    until the token limit even on the 426-character Darwin test page. The source
-    now performs an independent full-page OCR pass with a 4096-token allowance,
-    stores it separately, and requires an explicit copy into the editor. It does
-    not use the draft as context and can still misread facts or be slow on CPU.
+12. **AI correction is a separate text model, and it is small.** HunyuanOCR only
+    behaves reliably with its exact `OCR` instruction: an earlier attempt to make
+    it correct its own draft repeated output until the token limit, and a plain
+    second OCR pass ignored the draft entirely. Correction now runs on
+    Qwen2.5-1.5B-Instruct, which reads the whole transcription as text. A 1.5B
+    model at Q4 is weak; the prompt forbids rewriting, `temperature` is 0, and
+    `TextCorrector.correct` discards any result whose length falls outside
+    0.6-1.6x the input rather than storing a summary or a hallucination. It still
+    cannot know what the page actually said, so the UI never applies it silently.
 13. **Important fixed regression:** Hunyuan must receive the exact `OCR` prompt
     for transcription. The old GLM-style `Text Recognition:` prompt caused image
     descriptions instead of verbatim OCR. A regression test now asserts `OCR`.
@@ -196,9 +226,20 @@ Do not leave LAN binding enabled by default. The current safe default is localho
 
 ### 4. Continue review-ergonomics validation
 
-The first review-map implementation is complete using segmentation bounds and
-text offsets. Validate it in Chrome/mobile and decide whether genuine word-level
-coordinates/confidence justify a layout detector or different OCR engine.
+Section navigation, genuine per-word confidence, and estimated per-line scan
+positions are all implemented. What remains:
+
+1. Validate the uncertainty overlay in Chrome and at mobile width. The shading is
+   a backdrop `div` sitting behind a transparent `textarea`; if its font, padding
+   or wrapping ever drifts from the textarea's, the highlights slide off the
+   words. This is the one piece most likely to break on a font or CSS change.
+2. Decide the confidence threshold with real pages. `UNCERTAIN_PROBABILITY` is
+   0.65, tiered in the UI at 0.4. On the hard Darwin letter that marked 32 of
+   about 90 words, catching every genuine misreading seen so far plus some
+   correct ones. Too aggressive for a clean page is worse than useless.
+3. Only then decide whether measured word boxes justify a layout detector or a
+   different OCR engine. The current estimate is free and was right on 14 of 15
+   lines; a detector is a large change to beat it.
 
 Keep the existing side-by-side editor as a fallback. Do not delete raw output or
 the original page.

@@ -48,14 +48,56 @@ is claimed: there is no independently verified full transcription in this projec
 This demonstrates a working local pipeline, not production-ready handwriting
 accuracy. Testing several representative modern notes is still needed.
 
+## Per-word confidence and scan positions (17 September 2026)
+
+llama.cpp returns OpenAI-style `logprobs` for the multimodal chat endpoint, so the
+recognition model's own probability for each generated token is available. This was
+confirmed against the running container: the tokens returned reconstruct the output
+text exactly, so probabilities can be mapped to character offsets.
+
+On the Darwin letter (624 x 1008, 82 words), with words scored below 0.65 flagged:
+
+| Threshold | Words flagged | Notes |
+| --- | ---: | --- |
+| p < 0.50 | 25 | Caught every misreading inspected, including `Iuinally` (0.07), `fihiu` (0.08), `selatin` (0.06), `spicion` (0.18), `Bechenham` (0.23). |
+| p < 0.65 (shipped) | 32 | Adds correct readings such as `Sanderson` (0.60) and `digestion` (0.56). |
+| p < 0.80 | 43 | Too many correct words to be useful. |
+
+This is a deliberately hard 1874 cursive page. The rate on ordinary handwriting is
+not yet measured, and a confident score is not evidence of a correct reading.
+
+Scan positions come from a row-ink profile of each segment, with a 2% inset so the
+photograph's dark frame is not counted as a line, and each text line placed
+proportionally down the written area then snapped to the nearest band. Measured on
+the same page by overlaying the chosen band on the scan and inspecting it: **14 of
+15 lines landed on the correct line of handwriting**. The first line was one band
+high, because the scan's dark top edge survives as a band of its own. Horizontal
+position is not estimated; the marker spans the page width.
+
+## Local AI text correction (17 September 2026)
+
+Correction no longer re-runs OCR. A second `llama-server` holds a text-only
+instruction model that receives the finished transcription. End-to-end in the
+container, the Darwin page transcribed in **38.1 s** and Qwen2.5-1.5B-Instruct
+Q4_K_M corrected it in **12.2 s**, with `raw_text` and the editor text unchanged.
+
+Its output on that page was almost empty: `Octg. 74` to `Oct. 74` and nothing else.
+Passing it the list of low-confidence words made it worse, not better - it dropped
+a line and shifted the remainder. A 1.5B model at Q4 is too weak to recover words
+like `selatin` or `carli lopi` on this page. Refusing to guess is the correct
+failure mode, and the length guard in `TextCorrector.correct` exists for the other
+one, but a near-empty result is a weak feature.
+
 ## Application checks
 
-Seventeen automated tests passed: authenticated access, upload/edit/export with raw
+Twenty-four automated tests passed: authenticated access, upload/edit/export with raw
 text and original preservation, optimistic edit concurrency, malformed images,
 failed-job retry, truncated-output flags, interrupted-job recovery, and phone
-EXIF orientation, plus the Hunyuan prompt regression, PDF page fan-out, dense-page
-segmentation/review metadata, document grouping/export/append/whole-group deletion,
-queued cancellation, note deletion, and isolated AI re-read storage. The worker in these tests is deliberately fake; they test the
+EXIF orientation, plus the Hunyuan prompt and logprob-request regression, per-word
+uncertainty spans and ink-line mapping, the corrector's prompt/length guard/absence,
+PDF page fan-out, dense-page segmentation/review metadata, document
+grouping/export/append/whole-group deletion, queued cancellation, note deletion, and
+isolated correction storage. The worker in these tests is deliberately fake; they test the
 application, not recognition accuracy. JavaScript syntax checking also passed.
 
 Browser automation was unavailable in the session. The visual layout and phone

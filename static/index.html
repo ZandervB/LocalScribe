@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LocalScribe · Your handwriting, editable</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260917-phase46b">
-  <link rel="stylesheet" href="/static/review.css?v=20260917-phase46b">
-  <script defer src="/static/app.js?v=20260917-phase46b"></script>
+  <link rel="stylesheet" href="/static/style.css?v=20260917-phase47-aifix">
+  <link rel="stylesheet" href="/static/review.css?v=20260917-phase47-aifix">
+  <script defer src="/static/app.js?v=20260917-phase47-aifix"></script>
 </head>
 <body>
   <header><a class="brand" href="/">Local<span>Scribe</span><small>FROM PAPER TO POSSIBILITY</small></a><span class="local-badge">● &nbsp; On your computer</span></header>
@@ -40,20 +40,56 @@
       <div id="note-error" class="warning" hidden><p id="note-error-text"></p><button id="retry">Retry transcription</button></div>
       <div id="truncated" class="warning" hidden>This transcription reached the length limit and may be incomplete. Upload smaller sections of this page to recover the rest.</div>
       <div class="panes">
-        <section class="pane scan-pane"><div class="pane-heading"><h2>Original page</h2><button id="original" class="text-button">Download original ↗</button></div><div id="image-scroll" class="image-scroll"><div class="image-stage"><img id="page-image" alt="Scanned handwritten page"><span id="region-highlight" hidden></span></div></div></section>
-        <section class="pane text-pane"><div class="pane-heading"><h2>Editable text</h2><span id="word-count" class="muted">0 words</span></div><label for="transcript" class="visually-hidden">Transcription</label><textarea id="transcript" placeholder="Your transcription will appear here…" spellcheck="true"></textarea><div class="review"><label><input id="reviewed" type="checkbox"> I’ve checked this against the original</label><p>Handwriting can be misread. Check names, numbers, and missing lines.</p></div></section>
+        <section class="pane scan-pane"><div class="pane-heading"><h2>Original page</h2><button id="original" class="text-button">Download original ↗</button></div><div id="image-scroll" class="image-scroll"><div class="image-stage"><img id="page-image" alt="Scanned handwritten page"><span id="region-highlight" hidden></span><div id="uncertain-bands" class="uncertain-bands"></div></div></div></section>
+        <section class="pane text-pane">
+          <div class="pane-heading"><h2>Editable text</h2><span id="word-count" class="muted">0 words</span></div>
+          <div id="text-toolbar" class="text-toolbar">
+            <div id="view-tabs" class="view-tabs" role="tablist" aria-label="Text view">
+              <button id="view-edit" class="active" role="tab" aria-selected="true" aria-controls="panel-edit">Your text</button>
+              <button id="view-ai" role="tab" aria-selected="false" aria-controls="panel-ai" disabled>AI corrected</button>
+              <button id="view-compare" role="tab" aria-selected="false" aria-controls="panel-compare" disabled>Compare</button>
+            </div>
+            <button id="enhance-text" class="ai-button" title="A local language model re-reads the whole transcription and repairs recognition mistakes">✦ &nbsp;Fix with local AI</button>
+          </div>
+          <p id="ai-status" class="ai-status" role="status" hidden></p>
+          <div id="ai-failure" class="warning" hidden></div>
+          <div id="panel-edit" role="tabpanel">
+            <label for="transcript" class="visually-hidden">Transcription</label>
+            <div class="text-input"><div id="highlight-backdrop" class="highlight-backdrop" aria-hidden="true"></div><textarea id="transcript" placeholder="Your transcription will appear here…" spellcheck="true"></textarea></div>
+          </div>
+          <div id="panel-ai" class="ai-panel" role="tabpanel" hidden><pre id="corrected-text"></pre></div>
+          <div id="panel-compare" class="ai-panel" role="tabpanel" hidden>
+            <div class="compare-grid">
+              <div class="compare-column"><h3>Original OCR</h3><pre id="compare-left"></pre></div>
+              <div class="compare-column"><h3>AI corrected</h3><pre id="compare-right"></pre></div>
+            </div>
+            <p class="compare-legend"><span class="legend-removed">removed</span> <span class="legend-added">added</span> <span id="change-count"></span></p>
+          </div>
+          <div id="ai-apply" class="ai-apply" hidden><button id="use-enhanced" class="primary">Use this text in the editor</button><span>Your original OCR is kept either way. Check names, numbers and dates before saving.</span></div>
+          <div class="review"><label><input id="reviewed" type="checkbox"> I’ve checked this against the original</label><p>Handwriting can be misread. Check names, numbers, and missing lines.</p></div>
+        </section>
       </div>
       <section id="review-tools" class="review-tools" hidden>
-        <div><p class="eyebrow">GUIDED REVIEW</p><h2>Review by page section</h2><p class="muted">Choose a section to highlight its source area and machine-read text.</p></div>
-        <div id="region-buttons" class="review-buttons"></div>
-        <div class="risk-review"><strong>Check carefully</strong><p>Numbers and capitalized terms are shown as review cues, not confidence scores.</p><div id="risk-buttons" class="review-buttons"></div></div>
-      </section>
-      <section id="ai-tools" class="review-tools ai-tools" hidden>
-        <div><p class="eyebrow">EXPERIMENTAL LOCAL AI</p><h2>Compare a full-page AI re-read</h2><p class="muted">The handwriting model independently reads the full page again. Your original OCR is always preserved; compare both and verify names, dates, numbers, and facts.</p></div>
-        <div class="ai-actions"><button id="enhance-text">Re-read full page</button><span id="enhance-state"></span></div>
-        <div id="version-switch" class="version-switch" hidden><button id="show-original" class="active">Original OCR</button><button id="show-enhanced">AI enhanced</button><button id="use-enhanced" class="primary">Use enhanced in editor</button></div>
-        <pre id="version-text" hidden></pre>
-        <div id="enhance-error" class="warning" hidden></div>
+        <div class="review-top">
+          <div><p class="eyebrow">GUIDED REVIEW</p><h2>Check the words the model doubted</h2></div>
+          <label class="switch"><input id="show-uncertain" type="checkbox" checked><span>Highlight uncertain words</span></label>
+        </div>
+        <div id="confidence-block">
+          <div class="stepper">
+            <button id="previous-uncertain" title="Previous uncertain word">↑</button>
+            <button id="next-uncertain" class="primary">Next uncertain word</button>
+            <span id="uncertain-summary" class="muted"></span>
+          </div>
+          <div id="uncertain-buttons" class="review-buttons"></div>
+          <p class="review-footnote">These are the recognition model's own scores for the words it produced. A high score is not proof of a correct reading, and the place marked on the scan is estimated from the page layout.</p>
+        </div>
+        <div id="no-confidence" class="review-footnote" hidden>This note was transcribed before per-word scores were recorded. Re-run it to see them, or use the sections below.</div>
+        <details id="section-review">
+          <summary>Review by page section</summary>
+          <p class="muted">Choose a section to highlight its source area and machine-read text.</p>
+          <div id="region-buttons" class="review-buttons"></div>
+          <div class="risk-review"><strong>Other things worth checking</strong><p>Numbers and capitalized terms, shown as review cues rather than scores.</p><div id="risk-buttons" class="review-buttons"></div></div>
+        </details>
       </section>
       <div class="actions"><span id="save-state" role="status">Saved locally</span><div><button id="delete-note" class="danger-button">Delete</button><button id="copy">Copy text</button><button id="export">Export .txt</button><button id="save" class="primary">Save changes</button></div></div>
       <details id="raw-details"><summary>View the unedited machine transcription</summary><pre id="raw"></pre></details>
