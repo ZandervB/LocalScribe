@@ -100,9 +100,19 @@ transcript they supplied. Word error rate is computed on lowercased word tokens.
 | HunyuanOCR alone | 8.1% |
 | After AI correction | **6.4%** |
 
-That is a 1.7 point absolute, roughly 21% relative, reduction. OCR took 87.7 s and
-correction 57.7 s on four CPU threads. 21 of about 180 words were flagged as
-uncertain, and 22 lines of ink were detected.
+That is a 1.7 point absolute, roughly 21% relative, reduction. After the preamble
+fix below, OCR produced 169 words against a 172-word reference, and the corrected
+text 172. Timings on four CPU threads varied between runs: OCR 10.9 s to 87.7 s,
+correction 33.5 s to 57.7 s, for the same page and settings.
+
+13 words were flagged as uncertain and 22 lines of ink detected. The flagged words
+were the genuine error sites: `Its` (0.32) where the page reads `As`, `spoiled`
+(0.40) and `on` (0.33) where it reads `spilled out`, and `split` (0.15) where the
+photograph crops the preceding word off the left margin.
+
+Rendering each flagged word's chosen band over the scan and inspecting it,
+**all 9 bands sat on the correct line of handwriting**. This page has no dark
+border, which is what cost the Darwin page its first line.
 
 The corrections were not uniformly right. `pelump` to `plump`, `he mother` to
 `the mother`, and `wh` to `who` are correct. `roses` to `flesh` is wrong, where the
