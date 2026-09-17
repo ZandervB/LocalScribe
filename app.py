@@ -37,7 +37,9 @@ FORMATS = {"JPEG": (".jpg", "image/jpeg"), "PNG": (".png", "image/png"), "WEBP":
 CORRECTOR_SECTION_CHARS = 4500
 CORRECTOR_CONTEXT_CHARS = 9000
 READY_CACHE_SECONDS = 3.0
-INFERENCE_PIXELS = 1400
+# 2000 is a measured value. Downscaling to 1400 made HunyuanOCR stop transcribing
+# and start describing the page instead; see BENCHMARK.md.
+INFERENCE_PIXELS = 2000
 
 
 def now():
@@ -299,7 +301,12 @@ class LocalEngine(ChatClient):
     def transcribe(self, image_path):
         """Returns the text, whether it was cut short, and the model's own per-token scores."""
         text, truncated, scored = self._infer(image_path, "OCR", logprobs=True)
-        return strip_preamble(text), truncated, scored
+        text = strip_preamble(text)
+        if refuses_to_transcribe(text):
+            raise RuntimeError("The model described this page instead of reading it, which "
+                               "usually means the handwriting was too small or unclear to "
+                               "resolve. Try a sharper or closer photo of this page.")
+        return text, truncated, scored
 
 
 PREAMBLE = re.compile(r"^.{0,120}?(ocr|text in the image|transcription|extracted text).{0,60}:\s*\n+", re.IGNORECASE)
@@ -309,6 +316,39 @@ def strip_preamble(text):
     """Drop the chat sentence the OCR model sometimes writes before the page itself."""
     without = PREAMBLE.sub("", text, count=1)
     return without.strip() or text
+
+
+DESCRIBED = re.compile(
+    r"^\s*(#+\s*)?("
+    r"ocr\b.{0,30}(analysis|description)"
+    r"|text analysis"
+    r"|the (text|writing|handwriting) in (the|this) (image|page|picture)"
+    r"|the (image|picture|page) (shows|depicts|contains|appears to)"
+    r"|this (image|picture|page) (shows|depicts|contains)"
+    r"|the text (is|appears to be) (written )?in \w+"
+    r"|here is (a|the) (description|summary|analysis)"
+    r")", re.IGNORECASE)
+
+
+def refuses_to_transcribe(text):
+    """True when the model described the page instead of reading it back.
+
+    HunyuanOCR falls back to narrating an image it cannot read, sometimes looping the
+    same sentence until the token limit. Saving that as a transcription is worse than
+    failing, because it reads like text the page never contained.
+    """
+    stripped = text.strip()
+    if DESCRIBED.match(stripped):
+        return True
+    lines = [line.strip() for line in stripped.splitlines() if len(line.strip()) > 15]
+    if len(lines) < 6:
+        return False
+    shapes = {}
+    for line in lines:
+        # Numbered list items differ only by their number, so compare without digits.
+        shapes[re.sub(r"\d+", "#", line)] = shapes.get(re.sub(r"\d+", "#", line), 0) + 1
+    repeats = max(shapes.values())
+    return repeats >= 5 and repeats / len(lines) > 0.4
 
 
 UNCERTAIN_PROBABILITY = 0.65

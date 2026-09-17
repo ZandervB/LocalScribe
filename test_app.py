@@ -14,7 +14,7 @@ import pymupdf
 
 from app import (clean_correction, corrector_sections, create_app, INFERENCE_PIXELS, line_bands,
                  LocalEngine, map_lines_to_bands, refit_lines, Store, strip_preamble, TextCorrector,
-                 trim_background, uncertain_spans)
+                 refuses_to_transcribe, trim_background, uncertain_spans)
 
 
 class FakeEngine:
@@ -472,6 +472,25 @@ class NotebookTests(unittest.TestCase):
         row = next(item for item in self.client.get("/api/notes").json() if item["id"] == note_id)
         self.assertEqual(row["enhance_status"], "ready")
 
+    def test_a_described_or_looping_page_is_refused_not_saved_as_text(self):
+        self.assertTrue(refuses_to_transcribe(
+            "The text in the image is a handwritten note on correctional behavior."))
+        self.assertTrue(refuses_to_transcribe("### OCR - Text Analysis and Description:\nwhatever"))
+        self.assertTrue(refuses_to_transcribe("\n".join(
+            f"{n}. The text mentions the date of the case and the Minister." for n in range(1, 40))))
+        # Real pages must still pass, including ones that legitimately repeat.
+        self.assertFalse(refuses_to_transcribe(
+            "Registration number: 202819354\nCrimes: Assault with intent to do\nMurder x 4"))
+        self.assertFalse(refuses_to_transcribe("\n".join([
+            "The offender is serving life imprisonment in Leeuwkop Correctional",
+            "Centre and falls under the life's category of Van Wyk judgement,",
+            "He is an (A) group privilege since 2023.10.10 and (B) Medium Security",
+            "classification from 2011.03.08. He has benefited (C) six months",
+            "Special remission in 2012 and (D) six months at Anneity",
+            "in 2005. He has (E) four accomplices who are serving the",
+            "same length of sentence. Maagi Mjalefe Aldridge 202819481,"])))
+        self.assertFalse(refuses_to_transcribe("The image of my mother is still with me\nafter all these years"))
+
     def test_desk_around_a_photographed_page_is_trimmed_but_a_full_scan_is_not(self):
         photo = Image.new("RGB", (400, 600), (40, 35, 30))
         photo.paste(Image.new("RGB", (360, 400), "white"), (20, 40))
@@ -496,18 +515,30 @@ class NotebookTests(unittest.TestCase):
             self.assertEqual(original.size, (3000, 2400))
 
     def test_correction_model_may_still_be_loading_when_the_app_starts(self):
-        self.corrector.ready = lambda: False
-        note_id = self.upload()
-        self.wait(note_id)
-        self.assertFalse(self.client.get("/api/status").json()["corrector_ready"])
-        refused = self.client.post("/api/notes/" + note_id + "/enhance")
-        self.assertEqual(refused.status_code, 503)
-        self.assertIn("still starting", refused.json()["detail"])
-        self.assertEqual(self.client.get("/api/notes/" + note_id).json()["enhance_status"], "idle")
-        self.corrector.ready = lambda: True
-        self.assertTrue(self.client.get("/api/status").json()["corrector_ready"])
-        self.assertEqual(self.client.post("/api/notes/" + note_id + "/enhance").status_code, 202)
-        self.assertEqual(self.wait_enhancement(note_id)["enhance_status"], "ready")
+        # Automatic queuing is off here so this exercises the manual path alone.
+        with tempfile.TemporaryDirectory() as directory:
+            corrector = FakeCorrector()
+            corrector.ready = lambda: False
+            app = create_app(directory, FakeEngine(), "test-secret", corrector, auto_correct=False)
+            with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+                note = client.post("/api/notes", files={"file": ("n.png", self.image, "image/png")}).json()
+                end = time.monotonic() + 5
+                while time.monotonic() < end and client.get("/api/notes/" + note["id"]).json()["status"] != "ready":
+                    time.sleep(0.01)
+                self.assertFalse(client.get("/api/status").json()["corrector_ready"])
+                refused = client.post("/api/notes/" + note["id"] + "/enhance")
+                self.assertEqual(refused.status_code, 503)
+                self.assertIn("still starting", refused.json()["detail"])
+                self.assertEqual(client.get("/api/notes/" + note["id"]).json()["enhance_status"], "idle")
+                corrector.ready = lambda: True
+                self.assertTrue(client.get("/api/status").json()["corrector_ready"])
+                self.assertEqual(client.post("/api/notes/" + note["id"] + "/enhance").status_code, 202)
+                end = time.monotonic() + 5
+                while time.monotonic() < end:
+                    if client.get("/api/notes/" + note["id"]).json()["enhance_status"] not in ("queued", "running"):
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(client.get("/api/notes/" + note["id"]).json()["enhance_status"], "ready")
 
     def test_decoding_an_upload_does_not_stall_other_requests(self):
         holding, released = threading.Event(), threading.Event()
