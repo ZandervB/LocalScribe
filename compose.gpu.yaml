@@ -1,0 +1,10 @@
+services:
+  localscribe:
+    image: localscribe:gpu
+    build:
+      args:
+        LLAMA_IMAGE: ghcr.io/ggml-org/llama.cpp:server-cuda-b11011@sha256:95cdc1510dbc5bc15735529353d72ace9fc96b9aeb0dd6c4cdaf1a6b3f70776f
+    gpus: all
+    environment:
+      LOCALSCRIBE_GPU_LAYERS: "${LOCALSCRIBE_GPU_LAYERS:-99}"
+      LOCALSCRIBE_MMPROJ_OFFLOAD: "${LOCALSCRIBE_MMPROJ_OFFLOAD:-1}"

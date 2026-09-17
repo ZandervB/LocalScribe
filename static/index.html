@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LocalScribe · Your handwriting, editable</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260917-phase46b">
+  <link rel="stylesheet" href="/static/review.css?v=20260917-phase46b">
+  <script defer src="/static/app.js?v=20260917-phase46b"></script>
+</head>
+<body>
+  <header><a class="brand" href="/">Local<span>Scribe</span><small>FROM PAPER TO POSSIBILITY</small></a><span class="local-badge">● &nbsp; On your computer</span></header>
+  <section id="login" class="login" hidden>
+    <p class="eyebrow">YOUR PRIVATE NOTEBOOK</p><h1>A little less typing.<br>A little more thinking.</h1>
+    <p>Enter the access code from the LocalScribe terminal to open your notes.</p>
+    <form id="login-form"><label for="access-code">Access code</label><input id="access-code" autocomplete="off" required><button class="primary">Open notebook</button></form>
+  </section>
+  <main id="workspace" hidden>
+    <aside>
+      <div class="aside-heading"><h1>Your notes</h1><span id="note-count">0</span></div>
+      <p class="muted">Handwritten. Now searchable.</p>
+      <label class="primary upload-label" for="upload">＋ &nbsp; Add pages or PDF</label>
+      <input id="upload" class="visually-hidden" type="file" accept="image/jpeg,image/png,image/webp,application/pdf" multiple>
+      <label class="upload-option"><input id="segment-pages" type="checkbox" checked><span><strong>Smart page sections</strong><small>Split dense pages for clearer OCR</small></span></label>
+      <button id="sample" class="sample-button">Try the handwriting example <span>↗</span></button>
+      <button id="group-toggle" class="group-toggle">Create document</button>
+      <div id="group-actions" class="group-actions" hidden><span id="group-count">0 selected</span><div><button id="group-cancel">Cancel</button><button id="group-save" class="primary">Group selected</button></div></div>
+      <label for="search" class="visually-hidden">Search saved notes</label><input id="search" type="search" placeholder="Search your notes…">
+      <div id="notes" class="notes"></div>
+      <div class="aside-footer"><span id="engine-dot" class="dot"></span><span id="engine-state">Connecting to local model…</span><small>Your pages stay on this PC.</small></div>
+    </aside>
+    <section id="empty" class="empty">
+      <div class="paper-icon" aria-hidden="true">Aa<span>─────<br>────<br>─────</span></div>
+      <p class="eyebrow">MAKE ROOM FOR YOUR IDEAS</p><h2>Your handwriting.<br>A fresh start.</h2>
+      <p>Add photos or a PDF. We’ll turn each page into text<br>you can check, edit, and take anywhere.</p>
+      <p class="hint">JPEG, PNG or WebP up to 15 MB · PDF up to 50 MB / 50 pages</p>
+    </section>
+    <section id="editor" class="editor" hidden>
+      <div class="editor-top"><div><p class="eyebrow">NOTE WORKSPACE</p><label for="title" class="visually-hidden">Note title</label><input id="title" maxlength="160"></div><span id="note-state" class="status-pill"></span></div>
+      <div id="processing" class="processing" role="status" hidden><span class="spinner"></span><div><strong id="processing-title">Reading your handwriting…</strong><p>You can leave this page open or add another note. Pages are processed one at a time.</p><button id="cancel-job" hidden>Cancel queued transcription</button></div></div>
+      <div id="note-error" class="warning" hidden><p id="note-error-text"></p><button id="retry">Retry transcription</button></div>
+      <div id="truncated" class="warning" hidden>This transcription reached the length limit and may be incomplete. Upload smaller sections of this page to recover the rest.</div>
+      <div class="panes">
+        <section class="pane scan-pane"><div class="pane-heading"><h2>Original page</h2><button id="original" class="text-button">Download original ↗</button></div><div id="image-scroll" class="image-scroll"><div class="image-stage"><img id="page-image" alt="Scanned handwritten page"><span id="region-highlight" hidden></span></div></div></section>
+        <section class="pane text-pane"><div class="pane-heading"><h2>Editable text</h2><span id="word-count" class="muted">0 words</span></div><label for="transcript" class="visually-hidden">Transcription</label><textarea id="transcript" placeholder="Your transcription will appear here…" spellcheck="true"></textarea><div class="review"><label><input id="reviewed" type="checkbox"> I’ve checked this against the original</label><p>Handwriting can be misread. Check names, numbers, and missing lines.</p></div></section>
+      </div>
+      <section id="review-tools" class="review-tools" hidden>
+        <div><p class="eyebrow">GUIDED REVIEW</p><h2>Review by page section</h2><p class="muted">Choose a section to highlight its source area and machine-read text.</p></div>
+        <div id="region-buttons" class="review-buttons"></div>
+        <div class="risk-review"><strong>Check carefully</strong><p>Numbers and capitalized terms are shown as review cues, not confidence scores.</p><div id="risk-buttons" class="review-buttons"></div></div>
+      </section>
+      <section id="ai-tools" class="review-tools ai-tools" hidden>
+        <div><p class="eyebrow">EXPERIMENTAL LOCAL AI</p><h2>Compare a full-page AI re-read</h2><p class="muted">The handwriting model independently reads the full page again. Your original OCR is always preserved; compare both and verify names, dates, numbers, and facts.</p></div>
+        <div class="ai-actions"><button id="enhance-text">Re-read full page</button><span id="enhance-state"></span></div>
+        <div id="version-switch" class="version-switch" hidden><button id="show-original" class="active">Original OCR</button><button id="show-enhanced">AI enhanced</button><button id="use-enhanced" class="primary">Use enhanced in editor</button></div>
+        <pre id="version-text" hidden></pre>
+        <div id="enhance-error" class="warning" hidden></div>
+      </section>
+      <div class="actions"><span id="save-state" role="status">Saved locally</span><div><button id="delete-note" class="danger-button">Delete</button><button id="copy">Copy text</button><button id="export">Export .txt</button><button id="save" class="primary">Save changes</button></div></div>
+      <details id="raw-details"><summary>View the unedited machine transcription</summary><pre id="raw"></pre></details>
+    </section>
+  </main>
+  <dialog id="document-dialog" class="app-dialog">
+    <form id="document-form">
+      <p class="eyebrow">NEW DOCUMENT</p><h2>Group selected pages</h2>
+      <p class="dialog-copy">Name the document and check the page order before creating it.</p>
+      <label for="document-target">Destination</label>
+      <select id="document-target"><option value="">Create a new document</option></select>
+      <div id="document-name-fields"><label for="document-name">Document name</label><input id="document-name" maxlength="160" autocomplete="off"></div>
+      <ol id="document-order" class="document-order"></ol>
+      <div class="dialog-actions"><button id="document-dialog-cancel" type="button">Cancel</button><button class="primary" type="submit">Create document</button></div>
+    </form>
+  </dialog>
+  <dialog id="confirm-dialog" class="app-dialog compact-dialog">
+    <form id="confirm-form">
+      <p class="eyebrow">PLEASE CONFIRM</p><h2 id="confirm-title">Delete note?</h2><p id="confirm-copy" class="dialog-copy"></p>
+      <div class="dialog-actions"><button id="confirm-cancel" type="button">Keep it</button><button id="confirm-ok" class="danger-solid" type="submit">Delete</button></div>
+    </form>
+  </dialog>
+  <div id="toast" role="alert" hidden></div>
+</body>
+</html>

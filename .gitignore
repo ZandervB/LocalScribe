@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+data/
+models/
+runtime/
+samples/*.jpg
+samples/*.png
+benchmarks/iam-line-10/
+benchmarks/iam-line-10.json
+benchmarks/results/
+benchmarks/private/
+*.log
+.env

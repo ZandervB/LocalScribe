@@ -1,0 +1,22 @@
+name: localscribe
+services:
+  localscribe:
+    build: .
+    image: localscribe:local
+    init: true
+    ports:
+      - "${LOCALSCRIBE_BIND:-127.0.0.1}:${LOCALSCRIBE_PORT:-8090}:8090"
+    volumes:
+      - ./data:/opt/localscribe/data
+      - ./models:/opt/localscribe/models
+      - ./samples:/opt/localscribe/samples
+    environment:
+      LOCALSCRIBE_THREADS: "${LOCALSCRIBE_THREADS:-4}"
+      LOCALSCRIBE_GPU_LAYERS: "${LOCALSCRIBE_GPU_LAYERS:-0}"
+      LOCALSCRIBE_MMPROJ_OFFLOAD: "${LOCALSCRIBE_MMPROJ_OFFLOAD:-0}"
+      LOCALSCRIBE_OFFLINE: "${LOCALSCRIBE_OFFLINE:-0}"
+      LOCALSCRIBE_TOKEN: "${LOCALSCRIBE_TOKEN:-}"
+    mem_limit: 6g
+    cpus: 4
+    stop_grace_period: 30s
+    restart: unless-stopped

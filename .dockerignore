@@ -1,0 +1,11 @@
+.venv
+__pycache__
+data
+models
+runtime
+samples/*.jpg
+samples/*.png
+.git
+.env
+*.log
+test_*.py
