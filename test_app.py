@@ -472,6 +472,26 @@ class NotebookTests(unittest.TestCase):
         row = next(item for item in self.client.get("/api/notes").json() if item["id"] == note_id)
         self.assertEqual(row["enhance_status"], "ready")
 
+    def test_a_transcription_buried_in_commentary_is_recovered(self):
+        # Verbatim shapes returned by HunyuanOCR on a page it found hard.
+        fenced = ("The image appears to be a handwritten note or a draft of a legal document. The "
+                  "text is written in a cursive style and includes various legal terms and phrases. "
+                  "Here is a detailed transcription of the text in the image:\n\n```\n"
+                  "Recommendation to the Minister for Parole Consideration of\n"
+                  "Name of offender: Fela Johannes Thabo\n```")
+        recovered = strip_preamble(fenced)
+        self.assertTrue(recovered.startswith("Recommendation to the Minister"))
+        self.assertNotIn("```", recovered)
+        self.assertNotIn("cursive style", recovered)
+        self.assertFalse(refuses_to_transcribe(recovered))
+        unfenced = ("The image appears to be a handwritten legal document and here is a detailed "
+                    "transcription of the text in the image:\n\nRecommendation to the Minister\n"
+                    "Name of offender: Fela")
+        self.assertTrue(strip_preamble(unfenced).startswith("Recommendation to the Minister"))
+        # A description with no transcription in it must still be refused.
+        self.assertTrue(refuses_to_transcribe(strip_preamble(
+            "The image appears to be a handwritten document in Chinese. The text seems to be a list.")))
+
     def test_a_described_or_looping_page_is_refused_not_saved_as_text(self):
         self.assertTrue(refuses_to_transcribe(
             "The text in the image is a handwritten note on correctional behavior."))
@@ -490,6 +510,55 @@ class NotebookTests(unittest.TestCase):
             "in 2005. He has (E) four accomplices who are serving the",
             "same length of sentence. Maagi Mjalefe Aldridge 202819481,"])))
         self.assertFalse(refuses_to_transcribe("The image of my mother is still with me\nafter all these years"))
+
+    GOOD_SECTION = "Report by Educators\nThe offender was incarcerated with only Standard 6."
+    DESCRIBED = "The text in the image is a handwritten note on correctional behaviour."
+
+    def dense_upload(self):
+        stream = BytesIO()
+        Image.new("RGB", (600, 1800), "white").save(stream, format="PNG")
+        response = self.client.post("/api/notes", data={"segment": "true"},
+                                    files={"file": ("dense.png", stream.getvalue(), "image/png")})
+        return self.wait(response.json()["id"])
+
+    def test_a_refused_section_is_retried_once_at_a_larger_size(self):
+        seen = []
+
+        def transcribe(path):
+            name = Path(path).name
+            seen.append(name)
+            first_pass = "segment-01" in name and "larger" not in name
+            return (self.DESCRIBED if first_pass else self.GOOD_SECTION), False, []
+
+        self.engine.transcribe = transcribe
+        note = self.dense_upload()
+        self.assertTrue(any("larger" in name for name in seen), f"no retry happened: {seen}")
+        self.assertEqual(note["status"], "ready")
+        self.assertEqual(note["error"], "", "the retry succeeded, so there is nothing to warn about")
+        self.assertNotIn("The text in the image", note["raw_text"])
+        self.assertEqual(note["raw_text"].count("Report by Educators"), len(note["regions"]))
+
+    def test_one_unreadable_section_does_not_discard_the_rest_of_the_page(self):
+        def transcribe(path):
+            # Section one stays unreadable even after the larger retry.
+            return ((self.DESCRIBED if "segment-01" in Path(path).name else self.GOOD_SECTION), False, [])
+
+        self.engine.transcribe = transcribe
+        note = self.dense_upload()
+        self.assertEqual(note["status"], "ready")
+        self.assertIn("Report by Educators", note["raw_text"])
+        self.assertNotIn("The text in the image", note["raw_text"])
+        self.assertIn("could not be read", note["error"])
+        for region in note["regions"]:
+            self.assertEqual(note["raw_text"][region["start"]:region["end"]], region["text"])
+
+    def test_a_page_the_model_only_describes_is_refused_entirely(self):
+        self.engine.transcribe = lambda path: (
+            "The text in the image is a handwritten note on correctional behaviour.", False, [])
+        note = self.wait(self.upload())
+        self.assertEqual(note["status"], "error")
+        self.assertIn("described this page", note["error"])
+        self.assertEqual(note["raw_text"], "")
 
     def test_desk_around_a_photographed_page_is_trimmed_but_a_full_scan_is_not(self):
         photo = Image.new("RGB", (400, 600), (40, 35, 30))

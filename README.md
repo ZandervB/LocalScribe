@@ -106,6 +106,12 @@ The original file is preserved; an oriented copy with a maximum dimension of
 1400 pixels is used for recognition. Dense pages may work better as several
 closer photos. Output that hits the generation limit is flagged as incomplete.
 
+LocalScribe measures how tall your lines of handwriting are and enlarges a page
+whose writing is too small for the model to read, which is common for PDF scans.
+That costs time: a dense PDF page can take several minutes per section on CPU,
+against well under a minute for a close-up photo of the same words. Photographing
+a page closely is both faster and more accurate than scanning it small.
+
 **Crop the photo to the page when you can.** LocalScribe trims a dark surround
 automatically: if the edges of the photo are far darker than the paper, they are
 cut from the recognition copy. Measured on a real photo of a page on a dark desk,

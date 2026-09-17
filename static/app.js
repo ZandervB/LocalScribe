@@ -367,7 +367,8 @@ function renderNote(note, updateText = true) {
   $('processing').hidden = !busy;
   $('processing-title').textContent = note.status === 'queued' ? 'Your page is in the queue…' : 'Reading your handwriting…';
   $('cancel-job').hidden = note.status !== 'queued';
-  $('note-error').hidden = !['error','cancelled'].includes(note.status); $('note-error-text').textContent = note.error;
+  // A ready page can still carry a warning, e.g. a section the model could not read.
+  $('note-error').hidden = !note.error; $('note-error-text').textContent = note.error;
   $('retry').hidden = !!note.text || !['error','cancelled'].includes(note.status);
   $('truncated').hidden = !note.truncated;
   $('note-state').textContent = note.reviewed ? 'Reviewed' : states[note.status];

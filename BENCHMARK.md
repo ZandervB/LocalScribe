@@ -332,6 +332,106 @@ The startup change is visible in the log: the banner prints
 `AI correction: still loading in the background` and the app is reachable while the
 2.5 GB corrector is still loading.
 
+## Why PDF imports were narrated instead of read (17 September 2026)
+
+A six-page handwritten PDF imported as pure commentary: `### OCR - Text Analysis and
+Description:`, `The text is in Chinese`, and one page that looped the same sentence
+68 times to the token limit. The same content photographed directly had transcribed
+fine, so the PDF path was suspect.
+
+### Isolating it
+
+One page-one top segment, same bytes, four framings:
+
+| Variant | Size | Result |
+| --- | --- | --- |
+| As the app sent it | 1324x730 | narrates, then hides the real text in a code fence |
+| Whole page, unsegmented | 1324x1872 | narrates, claims the page is Chinese |
+| **Upscaled 2x** | 2648x1460 | **clean, correct transcription** |
+| Larger top slice | 1324x973 | narrates + fenced text |
+
+Identical pixels, merely enlarged, read perfectly. So it is neither the PDF renderer
+nor the aspect ratio. Sweeping the scale and measuring the median detected ink-line
+height against the outcome gives a sharp threshold:
+
+| Median ink-line height | Outcome |
+| ---: | --- |
+| 21 px, 28 px | **narrates the image** |
+| 34, 38, 42, 51 px | transcribes |
+
+**The variable is how tall a written line is in pixels, not megapixels.** The
+directly photographed page worked at only 0.72 MP per segment because it was shot
+close up; the PDF renders the same handwriting at 21 px per line. This also explains
+the earlier 1400 px experiment: it shrank lines further and made things worse.
+
+### Three changes
+
+1. **`PDF_DPI` 160 -> 200.** These PDFs embed 1654x2340 (3.9 MP) images while a
+   160 DPI render produced 1324x1872, discarding 36% of real pixels before the model
+   saw them.
+2. **Adaptive enlargement.** `legible_scale` measures the median ink-line height of
+   each section and enlarges it to `TARGET_LINE_PIXELS` (36). It is bounded to
+   enlarge only (`max(1.0, ...)`), by `MAX_UPSCALE` 2.0, and by a 4 MP ceiling, and
+   returns 1.0 when fewer than three lines are detected, so sparse pages, diagrams
+   and already-large photographs are untouched and cost nothing extra.
+3. **Escalation retry.** A section still refused after that is retried once at 1.4x,
+   capped at 6.5 MP, because the alternative is losing that part of the page.
+
+### Measured end to end, two pages through the real pipeline
+
+Every section now lands at 34-37 px. Five of six transcribed on the first pass
+(previously the top section failed on pages 1, 2 and 3), and the sixth was rescued:
+
+| | Size | Time | Result |
+| --- | --- | ---: | --- |
+| page 1 section 1, first pass | 2213x1207 | 181 s | narrates |
+| page 1 section 1, retry | 3098x1690 | 354 s | **transcribes correctly** |
+
+Two pages cost 8.4 minutes on eight CPU threads. That is the price of reading a page
+the model would otherwise narrate, and it is only paid where the writing is small.
+
+### It is not only PDFs: ordinary photographs gain too
+
+The threshold is document-dependent, not a clean line. The Darwin sample transcribes
+at 29 px per line; page 2 of the private PDF narrated at 30 px. Between roughly 28 and
+34 px the outcome depends on ink contrast and layout, so enlarging into the reliable
+zone is the safer default. Measured on real images:
+
+| Image | Median line | Action |
+| --- | ---: | --- |
+| Darwin letter sample | 29 px | enlarged x1.24 |
+| Private PDF rendered at 180 DPI | 30-32 px | enlarged x1.12-1.13 |
+| Six clean scanned pages | 28-32 px | enlarged x1.12-1.24 |
+| IAM line fragment (one line) | n/a | untouched |
+
+The Darwin letter already transcribed before this change, so it measures the cost and
+benefit on a page that was never broken:
+
+| | Before | After |
+| --- | ---: | ---: |
+| Wall time | 39.2 s | 45.9 s (+17%) |
+| Opening lines | `I. xix` / `Bechenham. Kent` | `16` / `Down,` / `Beckenham Kent.` |
+
+It recovered `Down,`, a line previously dropped altogether, corrected `Bechenham` to
+the real `Beckenham` and `I. xix` to `16`, and moved `going to the` towards the true
+`going to beg`. So the enlargement is not only a rescue for unreadable scans; it
+improves ordinary photographs for about a sixth more time.
+
+### Recovering text the model buried
+
+Asked to read a hard page, the model often narrates first and then puts the real
+transcription in a fenced block. `strip_preamble` now takes the fenced block when one
+is present, so those pages yield their text instead of being discarded. Verified
+against the exact strings the model returned.
+
+### A Windows cleanup hazard found on the way
+
+`segmented_inputs` cleans its temporary directory on exit. On Windows a file handle
+held a moment too long (a virus scanner reading a freshly written JPEG is enough)
+raises `PermissionError` there, which would fail a page *after* it had transcribed
+successfully. Both temporary directories now use `ignore_cleanup_errors=True`: a
+stray temp file is harmless, a lost transcription is not.
+
 ## Automatic correction, and three things it broke (17 September 2026)
 
 Correction is now queued by the worker as soon as a page transcribes, controlled by

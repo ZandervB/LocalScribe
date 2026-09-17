@@ -31,7 +31,15 @@ ROOT = Path(__file__).resolve().parent
 MAX_UPLOAD = 15 * 1024 * 1024
 MAX_PDF_UPLOAD = 50 * 1024 * 1024
 MAX_PDF_PAGES = 50
-PDF_DPI = 160
+# 200 DPI matches the resolution PDFs of scanned pages typically embed; 160 threw
+# away a third of the real pixels before the model ever saw them.
+PDF_DPI = 200
+# Measured against HunyuanOCR: it transcribes a page whose lines of ink are 34 px
+# tall or more, and narrates the image instead at 28 px or less. See BENCHMARK.md.
+TARGET_LINE_PIXELS = 36
+MAX_UPSCALE = 2.0
+MAX_INFERENCE_PIXELS = 4_000_000
+MAX_RETRY_PIXELS = 6_500_000
 Image.MAX_IMAGE_PIXELS = 25_000_000
 FORMATS = {"JPEG": (".jpg", "image/jpeg"), "PNG": (".png", "image/png"), "WEBP": (".webp", "image/webp")}
 CORRECTOR_SECTION_CHARS = 4500
@@ -209,17 +217,68 @@ class Store:
                 for number, (page, name) in enumerate(rendered, start=1)]
 
 
+def legible_scale(image):
+    """How much to enlarge a crop so its handwriting is big enough to be read.
+
+    The recognition model narrates a page whose lines of ink are too small instead of
+    transcribing it, and the size that matters is the height of a written line, not
+    the megapixels. Pages that are already big enough are returned untouched.
+    """
+    bands = ink_lines(image)
+    if len(bands) < 3:
+        return 1.0
+    median = sorted(high - low for low, high in bands)[len(bands) // 2]
+    if median <= 0:
+        return 1.0
+    room = math.sqrt(MAX_INFERENCE_PIXELS / max(1, image.width * image.height))
+    return max(1.0, min(TARGET_LINE_PIXELS / median, MAX_UPSCALE, room))
+
+
+def enlarge_for_reading(image):
+    scale = legible_scale(image)
+    if scale <= 1.05:
+        return image
+    return image.resize((round(image.width * scale), round(image.height * scale)),
+                        Image.Resampling.LANCZOS)
+
+
+def enlarge_again(path, factor=1.4):
+    """One larger copy of a section the model would not read, or None at the ceiling.
+
+    Only reached when a section has already been refused, so the extra time is spent
+    on the alternative of losing that part of the page entirely.
+    """
+    with Image.open(path) as image:
+        if image.width * image.height * factor * factor > MAX_RETRY_PIXELS:
+            return None
+        bigger = image.resize((round(image.width * factor), round(image.height * factor)),
+                              Image.Resampling.LANCZOS)
+    target = path.with_name(path.stem + "-larger.jpg")
+    bigger.save(target, "JPEG", quality=95)
+    return target
+
+
 @contextmanager
 def segmented_inputs(image_path, enabled):
     """Split tall pages near low-ink rows, preserving top-to-bottom order."""
-    if not enabled:
-        yield [{"path": image_path, "top": 0.0, "bottom": 1.0}]
+    with Image.open(image_path) as whole:
+        single = None
+        if not enabled:
+            single = whole.convert("RGB")
+        else:
+            width, height = whole.size
+            if height <= 1200 or height <= width * 1.15:
+                single = whole.convert("RGB")
+    if single is not None:
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="localscribe-page-", dir=image_path.parent,
+                                            ignore_cleanup_errors=True) as directory:
+            path = Path(directory) / "page.jpg"
+            enlarge_for_reading(single).save(path, "JPEG", quality=95)
+            yield [{"path": path, "top": 0.0, "bottom": 1.0}]
         return
     with Image.open(image_path) as source:
         width, height = source.size
-        if height <= 1200 or height <= width * 1.15:
-            yield [{"path": image_path, "top": 0.0, "bottom": 1.0}]
-            return
         pieces = min(4, max(2, (height + 849) // 850))
         probe = source.convert("L").resize((min(width, 256), height))
         pixels = probe.load()
@@ -233,11 +292,12 @@ def segmented_inputs(image_path, enabled):
         crops = [source.crop((0, top, width, bottom)).convert("RGB")
                  for top, bottom in zip(boundaries, boundaries[1:])]
     import tempfile
-    with tempfile.TemporaryDirectory(prefix="localscribe-segments-", dir=image_path.parent) as directory:
+    with tempfile.TemporaryDirectory(prefix="localscribe-segments-", dir=image_path.parent,
+                                        ignore_cleanup_errors=True) as directory:
         inputs = []
         for index, (crop, top, bottom) in enumerate(zip(crops, boundaries, boundaries[1:]), start=1):
             path = Path(directory) / f"segment-{index:02}.jpg"
-            crop.save(path, "JPEG", quality=95)
+            enlarge_for_reading(crop).save(path, "JPEG", quality=95)
             inputs.append({"path": path, "top": top / height, "bottom": bottom / height})
         yield inputs
 
@@ -301,19 +361,23 @@ class LocalEngine(ChatClient):
     def transcribe(self, image_path):
         """Returns the text, whether it was cut short, and the model's own per-token scores."""
         text, truncated, scored = self._infer(image_path, "OCR", logprobs=True)
-        text = strip_preamble(text)
-        if refuses_to_transcribe(text):
-            raise RuntimeError("The model described this page instead of reading it, which "
-                               "usually means the handwriting was too small or unclear to "
-                               "resolve. Try a sharper or closer photo of this page.")
-        return text, truncated, scored
+        return strip_preamble(text), truncated, scored
 
 
-PREAMBLE = re.compile(r"^.{0,120}?(ocr|text in the image|transcription|extracted text).{0,60}:\s*\n+", re.IGNORECASE)
+PREAMBLE = re.compile(r"^.{0,300}?(ocr|text in the image|transcription|extracted text).{0,60}:\s*\n+", re.IGNORECASE)
+FENCED = re.compile(r"```[a-zA-Z]*\n(.*?)(?:\n```|\Z)", re.DOTALL)
 
 
 def strip_preamble(text):
-    """Drop the chat sentence the OCR model sometimes writes before the page itself."""
+    """Recover the page text from whatever the OCR model wrapped around it.
+
+    Asked to read a page it finds hard, the model narrates the image first and then
+    puts the real transcription in a fenced block. The fence is the reliable marker,
+    so it wins; otherwise the leading chat sentence is dropped.
+    """
+    fenced = FENCED.search(text)
+    if fenced and fenced.group(1).strip():
+        return fenced.group(1).strip()
     without = PREAMBLE.sub("", text, count=1)
     return without.strip() or text
 
@@ -634,9 +698,18 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None, auto_corr
                 start = time.monotonic()
                 note = store.get(note_id)
                 outputs, regions, lines, uncertain, truncated = [], [], [], [], False
+                refused = 0
                 with segmented_inputs(store.files / f"{note_id}.preview.jpg", bool(note["segment"])) as inputs:
                     for index, item in enumerate(inputs, start=1):
                         segment_text, segment_truncated, scored = engine.transcribe(item["path"])
+                        if refuses_to_transcribe(segment_text):
+                            larger = enlarge_again(item["path"])
+                            if larger is not None:
+                                segment_text, segment_truncated, scored = engine.transcribe(larger)
+                        if refuses_to_transcribe(segment_text):
+                            # Keep the rest of the page rather than losing it to one bad section.
+                            refused += 1
+                            segment_text, scored, segment_truncated = "", [], False
                         start_offset = sum(len(output) + 1 for output in outputs)
                         outputs.append(segment_text)
                         regions.append({"index": index, "top": item["top"], "bottom": item["bottom"],
@@ -651,14 +724,22 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None, auto_corr
                             row = segment_text.count("\n", 0, span["start"])
                             uncertain.append({**span, "start": span["start"] + start_offset,
                                               "end": span["end"] + start_offset, "line": rows.get(row)})
+                if refused and refused == len(regions):
+                    raise RuntimeError("The model described this page instead of reading it back, "
+                                       "so nothing was saved. That usually means the handwriting was "
+                                       "too small or faint to resolve. Try a closer or sharper photo.")
                 # A segment boundary is a place the page was cut, not a paragraph break.
                 text = "\n".join(outputs)
+                unread = (f"{refused} of {len(regions)} sections of this page could not be read and were "
+                          "left out. The rest is below. Photograph those parts more closely to recover them."
+                          ) if refused else ""
                 with store.connect() as db:
                     db.execute("""UPDATE notes SET status='ready', raw_text=?, text=?,
-                        seconds=?, truncated=?, regions=?, uncertain=?, lines=?,
+                        seconds=?, truncated=?, regions=?, uncertain=?, lines=?, error=?,
                         reviewed=0, revision=revision+1 WHERE id=?""",
                                (text, text, time.monotonic() - start, int(truncated),
-                                json.dumps(regions), json.dumps(uncertain), json.dumps(lines), note_id))
+                                json.dumps(regions), json.dumps(uncertain), json.dumps(lines),
+                                unread, note_id))
                 if auto_correct and corrector is not None and text.strip():
                     # Appending keeps every queued page's transcription ahead of any correction.
                     with store.connect() as db:
