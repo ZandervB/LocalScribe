@@ -158,7 +158,18 @@ Read `BENCHMARK.md` before making claims about quality or performance.
 3. **Document groups still use note metadata.** PDF pages group automatically;
    arbitrary notes can be grouped, reordered before creation, appended, exported,
    or deleted as a group. There is no rename, post-save reorder, or ungroup UI.
-4. **No automatic crop/deskew page scanner.** Phone users should use a scanning app that exports JPG/PNG for now.
+4. **No automatic crop/deskew page scanner, and this now has measured cost.** On a
+   photo where a dark desk filled the bottom 22% of the frame, `ink_lines` scales its
+   threshold by `min/max` of the row-ink profile, so the desk set the scale and the
+   threshold landed at 84 while the whole handwriting area measured 56-102. Lines
+   merged into 0.1-0.2-page-tall blobs, and segmentation gave one OCR call a region
+   that was half desk, losing a paragraph of transcription. Five candidate fixes were
+   measured and all were rejected; see "Line detection and page framing" in
+   BENCHMARK.md for the numbers. In particular a brightness-based crop cropped clean
+   scanned pages to 10-33% of themselves, so it must not be shipped as a heuristic.
+   The real fix is a page-quadrilateral detector with a "only crop when a clear dark
+   border surrounds a bright quadrilateral" guard, validated on both photos and clean
+   scans. Until then the README tells users to crop before uploading.
 5. **Phone workflow is HTTP on LAN.** It uses an access code but no TLS. It should remain limited to trusted private Wi-Fi and should not be exposed by router port forwarding.
 6. **Access token changes on every container start** unless `LOCALSCRIBE_TOKEN` is set in `.env`. The README explains this.
 7. **`copy` on HTTP mobile browsers can be constrained.** The UI falls back to selecting the text for manual copy.

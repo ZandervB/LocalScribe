@@ -70,30 +70,37 @@ start unless you configure `LOCALSCRIBE_TOKEN` in `.env`.
    splits tall pages near low-ink gaps, reads each section, and joins the text in
    top-to-bottom order. Turn it off for diagrams or layouts where bands are not
    the intended reading order.
-2. Wait for transcription. Pages are processed one at a time.
-3. Check the scan beside the editable text and make corrections.
-4. Click **Save changes**, then **Copy text** or **Export .txt**.
-5. Words the recognition model scored as unlikely are shaded in the editable text
+3. Wait for transcription. Pages are processed one at a time.
+4. Check the scan beside the editable text and make corrections.
+5. Click **Save changes**, then **Copy text** or **Export .txt**.
+6. Words the recognition model scored as unlikely are shaded in the editable text
    and boxed on the scan beside them. **Next uncertain word** steps through them.
    These are the model's own per-word scores rather than a guarantee, and the
    place marked on the scan is estimated from the page layout. **Review by page
    section** and the older “worth checking” cues sit under the same panel.
-6. Optionally click **Fix with local AI** above the text. A second local model
+7. Optionally click **Fix with local AI** above the text. A second local model
    reads the whole transcription and repairs recognition mistakes in it. The
    **AI corrected** and **Compare** tabs show what changed word by word; you then
    choose whether to put it in the editor. The original OCR is never overwritten.
-7. Use **Create document** to select existing notes in page order. The dialog can
+8. Use **Create document** to select existing notes in page order. The dialog can
    create a new document or append pages to an existing one, and its arrow buttons
    adjust page order before saving. Imported PDF pages are grouped automatically.
-8. Queued jobs can be cancelled from the sidebar. Individual notes, or a complete
+9. Queued jobs can be cancelled from the sidebar. Individual notes, or a complete
    document and all its pages, can be deleted through confirmation dialogs; an
    actively running local-AI task must finish first.
-9. Use search to find saved notes. Mark a note reviewed once you have checked it.
+10. Use search to find saved notes. Mark a note reviewed once you have checked it.
 
 Each image is one note in this prototype. Maximum upload: 15 MB and 25 megapixels.
 The original file is preserved; an oriented copy with a maximum dimension of
 2000 pixels is used for recognition. Dense pages may work better as several
 closer photos. Output that hits the generation limit is flagged as incomplete.
+
+**Crop the photo to the page before uploading.** LocalScribe has no page detection
+yet, so a desk, tablecloth or floor left in the frame is treated as part of the
+page. Measured on a real photo where the desk filled the bottom 22%: the ink
+threshold that locates lines was thrown off enough to merge whole paragraphs into
+one highlight band, and page segmentation spent a whole section on the desk, which
+cost an entire paragraph of transcription. Your phone's built-in crop is enough.
 
 To download the optional public test examples once:
 
@@ -195,7 +202,7 @@ persistent access code private.
 | Cannot connect to Docker daemon / named pipe | Open Docker Desktop, wait for its engine, and check that Linux containers are selected. |
 | Port 8090 already in use | Stop the direct Windows version, or set `LOCALSCRIBE_PORT=8092` in `.env`; then open port 8092. The startup log shows the internal default port, so adjust its URL. |
 | First startup seems slow | Follow `docker compose logs -f`; the model downloads total about 3.8 GB. |
-| Every startup takes minutes | Both models load from the bind-mounted `models/` folder, which is slow through WSL. The 2.5 GB correction model dominates. Set `LOCALSCRIBE_CORRECTOR=0` in `.env` if you do not use AI correction. |
+| Every startup takes minutes | Models load from the bind-mounted `models/` folder, which is slow through WSL. Transcription is usable as soon as the handwriting model is ready; the 2.5 GB correction model keeps loading in the background and **Fix with local AI** switches on by itself. Set `LOCALSCRIBE_CORRECTOR=0` in `.env` to skip it entirely. |
 | Access code rejected after restart | Read the latest code from the log, or set a persistent `LOCALSCRIBE_TOKEN` in `.env`. |
 | Model exited / out of memory | Inspect `data/engine.log` and `docker compose logs`; give Docker more memory or use smaller page images. |
 | Poor handwriting recognition | Try better lighting, a straight page, or smaller sections; review all output. More RAM alone does not improve recognition quality. |
@@ -297,6 +304,3 @@ model transcription is tested separately and documented in the benchmark notes.
 
 Upstream software/model licenses continue to apply. Public examples are downloaded
 separately for evaluation; check their source terms before redistributing them.
-#   L o c a l S c r i b e 
- 
- 

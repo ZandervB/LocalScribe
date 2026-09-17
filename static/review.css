@@ -56,7 +56,9 @@
 .uncertain-band.doubtful { background: rgb(186 82 62 / 12%); box-shadow: inset 3px 0 rgb(186 82 62 / 70%); }
 .uncertain-band.focused { background: rgb(199 129 73 / 28%); box-shadow: inset 0 0 0 2px #c78149, 0 0 0 1px #fff; }
 
-.text-input { position: relative; display: flex; flex: 1; min-height: 0; background: #fff; }
+/* The editor never scrolls itself: iOS coalesces a textarea's scroll events
+   during momentum, which left the highlight layer trailing behind the words. */
+.text-input { position: relative; display: block; flex: 1 0 auto; background: #fff; }
 
 .highlight-backdrop {
   position: absolute;
@@ -71,7 +73,7 @@
   pointer-events: none;
 }
 
-.text-input #transcript { position: relative; z-index: 1; background: transparent; }
+.text-input #transcript { position: relative; z-index: 1; display: block; width: 100%; overflow: hidden; resize: none; background: transparent; }
 .uncertain-word { border-radius: 3px; background: #f7e7cf; box-shadow: 0 1px 0 #d9a86b; }
 .uncertain-word.doubtful { background: #f7dcd4; box-shadow: 0 1px 0 #cf8674; }
 .uncertain-word.focused { background: #ffd79a; box-shadow: 0 0 0 2px #c78149; }
@@ -166,7 +168,7 @@
 .ai-status { margin: 0; padding: 10px 18px; border-bottom: 1px solid var(--line); background: #fcfcf9; color: var(--muted); font-size: 11px; line-height: 1.5; }
 #ai-failure { margin: 12px 18px 0; }
 
-#panel-edit { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+#panel-edit { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch; }
 .ai-panel { display: flex; flex-direction: column; flex: 1; min-height: 0; padding: 18px; overflow: auto; max-height: 620px; }
 .ai-panel pre { flex: 1; margin: 0; background: #fff; color: var(--ink); }
 #corrected-text { min-height: 360px; }
@@ -248,4 +250,28 @@ mark.diff-removed, mark.diff-added { border-radius: 3px; padding: 1px 2px; }
 
 @media (prefers-reduced-motion: reduce) {
   #region-highlight { transition: none; }
+}
+
+@media (max-width: 640px) {
+  /* 16px keeps iOS from zooming the page when the editor takes focus. */
+  input:not([type=checkbox]), textarea, select, #search, #transcript { font-size: 16px; }
+  #transcript { padding: 16px; min-height: 260px; }
+  .highlight-backdrop { padding: 16px; font-size: 16px; }
+  .panes { min-height: 0; }
+  .pane-heading { height: auto; min-height: 48px; padding: 10px 14px; flex-wrap: wrap; }
+  .image-scroll { padding: 12px; max-height: 46vh; }
+  .image-scroll img { max-width: 100%; }
+  .text-toolbar { flex-wrap: wrap; gap: 8px; padding: 12px 14px; }
+  .view-tabs { flex: 1 1 100%; }
+  .view-tabs button { flex: 1; padding: 10px 6px; }
+  #enhance-text { width: 100%; }
+  .ai-panel { max-height: none; padding: 14px; }
+  .compare-grid { grid-template-columns: 1fr; }
+  .review-tools { padding: 14px; }
+  .review-top { flex-direction: column; }
+  .uncertain-chip { padding: 9px 12px; }
+  button, .primary { min-height: 42px; }
+  .view-tabs button, .text-button, .note-side-actions button, #cancel-job { min-height: 0; }
+  pre { overflow-wrap: anywhere; }
+  .document-order li { grid-template-columns: 25px minmax(0,1fr) auto; }
 }

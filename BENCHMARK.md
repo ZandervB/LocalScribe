@@ -142,9 +142,111 @@ transcript and, because scan positions are mapped per text line, pushed every
 highlight on the page down by one line. `strip_preamble` removes it in
 `LocalEngine.transcribe`, before offsets are computed.
 
+## Production-readiness pass (17 September 2026)
+
+Four defects were found by inspection and confirmed by measurement, then fixed.
+Each fix has a test that fails without it.
+
+| Defect | Evidence before | After |
+| --- | --- | --- |
+| `POST /api/notes` decoded images and rendered PDF pages on the event loop, stalling every other request | 30-page PDF import: worst `/api/status` latency **3438 ms** (idle baseline 15 ms) | **750 ms**, the remainder being ordinary GIL contention from Pillow/PyMuPDF |
+| An `Authorization` header with any non-ASCII byte raised `TypeError` from `secrets.compare_digest` | unauthenticated request → unhandled exception, HTTP 500 and a traceback | HTTP 401. The same bug made any non-ASCII `LOCALSCRIBE_TOKEN` return 500 on every request |
+| `/api/notes` omitted `enhance_status`, so the sidebar offered **Delete** on a note whose AI correction was running | the button 409'd when pressed | column returned; the button is hidden while correction runs |
+| The browser polled every 2.5 s forever, re-fetching the open note and (with `LOCALSCRIBE_CORRECTOR=0`) re-probing `llama-server`'s health on every tick | constant load on the same CPU cores the model needs | 2 s while work is in flight, 15 s idle; readiness probes cached 3 s server-side and gated 10 s client-side |
+
+Not changed, deliberately: SQLite stays on the default rollback journal. WAL would
+be the usual hardening, but `data/` is a Windows bind mount into WSL 2 for the
+supported Docker path, where WAL's shared-memory file is unreliable. Measured
+contention did not justify the risk — the notes list costs 6.3 ms at 800 notes.
+
+Recognition settings were **not** touched. The `OCR` prompt, the 0.65 uncertainty
+threshold, the 2000 px inference copy and the 2048-token output limit are all
+values this document measured; changing them needs a new benchmark run, not an
+edit. See "Measurable accuracy experiments" below.
+
+## Line detection and page framing (17 September 2026)
+
+Two user-supplied pages were analysed against their stored `regions`, `lines` and
+`uncertain` data. Both showed the scan highlight landing on the wrong line, for two
+unrelated reasons.
+
+**Page A, cursive on plain paper.** `ink_lines` found 11 bands where the page has 9
+lines of writing, because descenders were detected as separate 0.3%-tall bands. In
+`map_lines_to_bands` those slivers are snap targets sitting right beside the real
+line, so segment 2's first row snapped to a 0.6%-tall sliver instead of the line
+above it — the visible off-by-one.
+
+**Page B, ruled paper photographed on a dark desk.** The desk fills the bottom 22%
+of the frame. `ink_lines` scales its threshold as `min(profile) + 0.16 x (max - min)`,
+and because the desk sets `max`, the threshold lands at **84** while the entire
+handwriting area measures **56-102**. Most lines therefore fall below it and
+whole paragraphs collapse into one band: 19 text rows against 12 bands, with single
+bands 9.6% and 21% of the page tall. The same framing costs real text — page
+segmentation gave segment 2 a region that is roughly half desk, and the model
+returned one line for it, so **a whole paragraph of that page is missing from the
+transcription**.
+
+### Fixes attempted and rejected
+
+Each candidate was scored on page A's recorded bands, page B, and the six clean
+scanned pages in `benchmarks/private/pdf-import-qa/`.
+
+| Candidate | Result | Verdict |
+| --- | --- | --- |
+| Merge sub-median bands into their neighbour | Fixes page A. Clean scans lose bands (28->25, 31->28) and the worst blob grows 0.043 -> 0.072 of page height | Rejected |
+| Exclude short bands from snap candidates only | Fixes page A's off-by-one exactly. Still changes the mapping on 4 of 6 clean scans | Rejected |
+| Percentile threshold (10th/80th) instead of min/max | Page B seg1 12 -> 10 bands, no closer to its 19 rows; worst blob on clean scans 0.043 -> 0.082 | Rejected |
+| Per-strip profiling (6-16 vertical strips), swept with the above | Best case page B seg1 12 -> 14 against a target of 19, while regressing clean scans | Rejected |
+| Crop to the bright page before OCR | Page B: keeps 78%, removing exactly the desk, bands 2 -> 16. Clean scans are cropped to **10-33%** of themselves | Rejected as unsafe |
+
+The decisive measurement is that band height cannot separate the two cases. Page A's
+spurious sliver is 0.158 of its page's median band height; genuine short lines on the
+clean scans measure 0.088, 0.125, 0.140, 0.161 and 0.172. The distributions overlap,
+so no threshold fixes page A without disturbing pages that are currently correct.
+
+**Conclusion:** the row-ink profile has reached its limit. Real per-word or per-line
+boxes need a layout detector, and page framing needs a proper quadrilateral page
+detector rather than a brightness heuristic. Neither was shipped. The one change made
+here is unrelated to thresholds: segments are now joined with a single newline.
+
+### Shipped: segment joins are no longer paragraph breaks
+
+Segment outputs were joined with `
+
+`, so a page cut mid-sentence produced a blank
+line in the transcript. Page A's stored text contained
+`...it was still alive, the bad
+
+split and I remember...`, where the page simply
+continues. Segments now join with `
+`, and the `regions`/`uncertain` character
+offsets were corrected from +2 to +1 to match. A test asserts every stored offset
+still slices back to its own recorded text.
+
+## Startup and interface (17 September 2026)
+
+- **The app no longer waits for the correction model.** `run.py` blocked on
+  `wait_for(corrector, ..., 900)` before starting uvicorn, so nothing was reachable
+  until the 2.5 GB Qwen3-4B model had loaded — the slowest part of startup on a
+  bind-mounted `models/` folder, and the cause of the "every startup takes minutes"
+  troubleshooting entry. It now loads on a background thread while transcription is
+  already usable; `/api/status` reports `corrector_ready` and the UI enables the
+  button when it arrives.
+- **iOS highlight lag.** The uncertain-word layer was a backdrop kept in step with
+  `backdrop.scrollTop = editor.scrollTop` on the textarea's `scroll` event. Safari
+  coalesces those events during momentum scrolling, so the highlights trailed the
+  words and snapped into place when scrolling stopped. The textarea now grows to its
+  content and `#panel-edit` scrolls instead, so the text and its highlights are one
+  block and no synchronisation exists to fall behind. Reported by the user on an
+  iPhone; the fix is structural but has **not** been verified in a real browser, as
+  no browser automation is available here.
+- **Mobile layout.** Inputs are 16px at <=640px so iOS stops zooming on focus,
+  controls reach a 42px touch target, the toolbar/tabs/compare grid stack, and the
+  scan pane is capped at 46vh. Also unverified in a real browser.
+
 ## Application checks
 
-Twenty-six automated tests passed: authenticated access, upload/edit/export with raw
+Twenty-nine automated tests passed: authenticated access, upload/edit/export with raw
 text and original preservation, optimistic edit concurrency, malformed images,
 failed-job retry, truncated-output flags, interrupted-job recovery, and phone
 EXIF orientation, plus the Hunyuan prompt and logprob-request regression, per-word

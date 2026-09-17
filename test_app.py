@@ -1,3 +1,4 @@
+import asyncio
 from io import BytesIO
 import json
 from pathlib import Path
@@ -5,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -200,7 +202,11 @@ class NotebookTests(unittest.TestCase):
                                     files={"file": ("dense.png", stream.getvalue(), "image/png")})
         note = self.wait(response.json()["id"])
         self.assertGreaterEqual(len(self.engine.calls), 2)
-        self.assertIn("\n\n", note["raw_text"])
+        self.assertNotIn("\n\n", note["raw_text"])
+        for region in note["regions"]:
+            self.assertEqual(note["raw_text"][region["start"]:region["end"]], region["text"])
+        for span in note["uncertain"]:
+            self.assertEqual(note["raw_text"][span["start"]:span["end"]], span["text"])
         self.assertEqual(len(note["regions"]), len(self.engine.calls))
         self.assertEqual(note["regions"][0]["top"], 0)
         self.assertEqual(note["regions"][-1]["bottom"], 1)
@@ -407,6 +413,74 @@ class NotebookTests(unittest.TestCase):
         self.assertEqual(map_lines_to_bands("one\ntwo\nthree", bands, 0), {0: 0, 1: 1, 2: 2})
         self.assertEqual(map_lines_to_bands("one\n\ntwo", bands, 5), {0: 5, 2: 7})
         self.assertEqual(map_lines_to_bands("text", [], 0), {})
+
+    def test_non_ascii_access_code_is_rejected_not_crashed(self):
+        async def send_header(raw):
+            statuses = []
+            scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                     "method": "GET", "path": "/api/notes", "raw_path": b"/api/notes",
+                     "query_string": b"", "root_path": "", "scheme": "http",
+                     "headers": [(b"host", b"test"), (b"authorization", raw)],
+                     "client": ("127.0.0.1", 1), "server": ("test", 80)}
+
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def send(message):
+                if message["type"] == "http.response.start":
+                    statuses.append(message["status"])
+            await self.app(scope, receive, send)
+            return statuses
+
+        self.assertEqual(asyncio.run(send_header("Bearer éé".encode("latin-1"))), [401])
+        self.assertEqual(asyncio.run(send_header(b"Bearer wrong")), [401])
+        self.assertEqual(asyncio.run(send_header(b"Bearer test-secret")), [200])
+
+    def test_note_list_reports_correction_state_for_the_sidebar(self):
+        note_id = self.upload()
+        self.wait(note_id)
+        self.assertEqual(self.client.post("/api/notes/" + note_id + "/enhance").status_code, 202)
+        self.wait_enhancement(note_id)
+        row = next(item for item in self.client.get("/api/notes").json() if item["id"] == note_id)
+        self.assertEqual(row["enhance_status"], "ready")
+
+    def test_correction_model_may_still_be_loading_when_the_app_starts(self):
+        self.corrector.ready = lambda: False
+        note_id = self.upload()
+        self.wait(note_id)
+        self.assertFalse(self.client.get("/api/status").json()["corrector_ready"])
+        refused = self.client.post("/api/notes/" + note_id + "/enhance")
+        self.assertEqual(refused.status_code, 503)
+        self.assertIn("still starting", refused.json()["detail"])
+        self.assertEqual(self.client.get("/api/notes/" + note_id).json()["enhance_status"], "idle")
+        self.corrector.ready = lambda: True
+        self.assertTrue(self.client.get("/api/status").json()["corrector_ready"])
+        self.assertEqual(self.client.post("/api/notes/" + note_id + "/enhance").status_code, 202)
+        self.assertEqual(self.wait_enhancement(note_id)["enhance_status"], "ready")
+
+    def test_decoding_an_upload_does_not_stall_other_requests(self):
+        holding, released = threading.Event(), threading.Event()
+        original = Store.add
+
+        def blocking_add(self, *args, **kwargs):
+            holding.set()
+            released.wait(timeout=10)
+            return original(self, *args, **kwargs)
+
+        answers = []
+        with unittest.mock.patch.object(Store, "add", blocking_add):
+            uploader = threading.Thread(target=lambda: answers.append(
+                self.client.post("/api/notes", files={"file": ("note.png", self.image, "image/png")}).status_code))
+            uploader.start()
+            self.assertTrue(holding.wait(timeout=5), "upload never reached image decoding")
+            started = time.monotonic()
+            answered = self.client.get("/api/status")
+            waited = time.monotonic() - started
+            released.set()
+            uploader.join(timeout=15)
+        self.assertEqual(answers, [202])
+        self.assertEqual(answered.status_code, 200)
+        self.assertLess(waited, 2, "a decoding upload blocked an unrelated request")
 
 
 if __name__ == "__main__":

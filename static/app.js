@@ -7,6 +7,9 @@ let aiView = 'edit', correctorReady = false, correctorModel = 'a local language 
 let comparedKey = '', lastEnhanceStatus = new Map();
 let uncertainSpans = [], locatedSpans = [], pageLines = [], focused = -1, showUncertain = true;
 const states = {queued: 'In queue', running: 'Transcribing', ready: 'Needs review', error: 'Needs attention', cancelled: 'Cancelled'};
+const BUSY = ['queued', 'running'];
+let pollTimer = null, statusChecked = 0;
+function isBusy(note) { return !!note && (BUSY.includes(note.status) || BUSY.includes(note.enhance_status)); }
 
 function toast(message) {
   $('toast').textContent = message; $('toast').hidden = false;
@@ -23,7 +26,7 @@ async function api(path, options = {}) {
   return response;
 }
 function run(action) { return async (...args) => { try { await action(...args); } catch (error) { toast(error.message); } }; }
-function changed() { dirty = true; $('save-state').textContent = 'Unsaved changes'; countWords(); refreshUncertainty(); }
+function changed() { dirty = true; $('save-state').textContent = 'Unsaved changes'; autoGrow(); countWords(); refreshUncertainty(); }
 function countWords() { $('word-count').textContent = ($('transcript').value.trim().match(/\S+/g) || []).length + ' words'; }
 function mayLeave() { return !dirty || confirm('You have unsaved edits. Leave this note without saving?'); }
 function uniqueDocuments() {
@@ -120,10 +123,18 @@ function renderList() {
   }
   $('notes').replaceChildren(...nodes);
 }
+function autoGrow() {
+  const editor = $('transcript');
+  editor.style.height = 'auto';
+  editor.style.height = editor.scrollHeight + 'px';
+}
 function selectText(start, end) {
-  const editor = $('transcript'); editor.focus(); editor.setSelectionRange(start, end);
-  const lineHeight = parseFloat(getComputedStyle(editor).lineHeight) || 24;
-  editor.scrollTop = Math.max(0, editor.value.slice(0, start).split('\n').length * lineHeight - editor.clientHeight / 3);
+  const editor = $('transcript'), panel = $('panel-edit');
+  editor.focus({preventScroll: true}); editor.setSelectionRange(start, end);
+  const style = getComputedStyle(editor);
+  const lineHeight = parseFloat(style.lineHeight) || 24;
+  const offset = (parseFloat(style.paddingTop) || 0) + editor.value.slice(0, start).split('\n').length * lineHeight;
+  panel.scrollTop = Math.max(0, offset - panel.clientHeight / 3);
 }
 function showRegion(region, button) {
   const highlight = $('region-highlight');
@@ -171,7 +182,6 @@ function paintBackdrop() {
   }
   fragment.append(document.createTextNode(value.slice(cursor) + '\n'));
   backdrop.replaceChildren(fragment);
-  backdrop.scrollTop = editor.scrollTop;
 }
 function paintBands() {
   const stage = $('uncertain-bands');
@@ -318,6 +328,8 @@ function setView(view) {
     $(panel).hidden = !active;
   }
   $('ai-apply').hidden = view === 'edit';
+  // scrollHeight is 0 while the panel is hidden, so size the editor once it is shown.
+  if (view === 'edit') autoGrow();
   if (view === 'ai') $('corrected-text').textContent = current.enhanced_text;
   if (view === 'compare') renderComparison();
 }
@@ -357,10 +369,13 @@ function renderNote(note, updateText = true) {
   for (const id of ['title','transcript','reviewed','save','copy','export']) $(id).disabled = busy;
   $('delete-note').disabled = note.status === 'running';
   if (updateText) {
-    $('title').value = note.title; $('transcript').value = note.text; $('reviewed').checked = !!note.reviewed;
+    // Rewriting these on every poll would drop the caret out of text the reader is checking.
+    if ($('title').value !== note.title) $('title').value = note.title;
+    if ($('transcript').value !== note.text) $('transcript').value = note.text;
+    $('reviewed').checked = !!note.reviewed;
     $('raw').textContent = note.raw_text; dirty = false;
     $('save-state').textContent = note.seconds != null ? `Saved locally · Transcribed in ${Math.round(note.seconds)}s` : 'Saved locally';
-    countWords();
+    autoGrow(); countWords();
   }
   renderReview(note); renderEnhancement(note); renderList();
 }
@@ -374,18 +389,35 @@ async function selectNote(id) {
   imageURL = URL.createObjectURL(image); $('page-image').src = imageURL;
   renderNote(note);
 }
+function currentStale() {
+  const row = current && listItems.find(item => item.id === current.id);
+  if (!row) return false;
+  return row.status !== current.status || row.enhance_status !== current.enhance_status
+    || !!row.reviewed !== !!current.reviewed || row.title !== current.title;
+}
 async function refresh() {
   if (!token) return;
-  if (!correctorReady) await updateStatus();
+  if (!correctorReady && Date.now() - statusChecked > 10000) await updateStatus();
   const response = await api('/api/notes?q=' + encodeURIComponent($('search').value));
   listItems = await response.json(); renderList();
-  if (current && !dirty && !saving) {
+  if (current && !dirty && !saving && (isBusy(current) || currentStale())) {
     const id = current.id, ticket = selection;
     const note = await (await api('/api/notes/' + id)).json();
     if (current?.id === id && ticket === selection && !dirty && !saving) renderNote(note);
   }
+  schedulePoll();
+}
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  // Idle polling competes with the model for the same CPU cores, so back right off.
+  const delay = listItems.some(isBusy) || isBusy(current) ? 2000 : 15000;
+  pollTimer = setTimeout(async () => {
+    if (token && !$('workspace').hidden) await refresh().catch(() => {});
+    schedulePoll();
+  }, delay);
 }
 async function updateStatus() {
+  statusChecked = Date.now();
   const status = await (await api('/api/status')).json();
   $('engine-state').textContent = status.engine_ready ? 'Local transcription ready' : 'Local model is starting…';
   $('engine-dot').className = 'dot' + (status.engine_ready ? ' ready' : '');
@@ -398,6 +430,7 @@ async function connect() {
   sessionStorage.setItem('localscribe-access', token);
   $('login').hidden = true; $('workspace').hidden = false;
   await refresh();
+  schedulePoll();
 }
 async function save() {
   if (!current || saving) return;
@@ -531,15 +564,13 @@ $('show-uncertain').onchange = () => {
   $('uncertain-buttons').hidden = !showUncertain;
   paintBackdrop(); paintBands();
 };
-$('transcript').addEventListener('scroll', () => { $('highlight-backdrop').scrollTop = $('transcript').scrollTop; });
 for (const event of ['click', 'keyup']) $('transcript').addEventListener(event, () => {
   const caret = $('transcript').selectionStart;
   const index = locatedSpans.findIndex(span => caret >= span.at && caret <= span.to);
   if (index >= 0 && index !== focused) focusUncertain(index, false);
 });
-window.addEventListener('resize', () => paintBackdrop());
+window.addEventListener('resize', () => { autoGrow(); paintBackdrop(); });
 for (const id of ['title','transcript','reviewed']) $(id).addEventListener('input', changed);
 window.addEventListener('beforeunload', event => { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
 document.addEventListener('keydown', run(async event => { if ((event.ctrlKey || event.metaKey) && event.key === 's') { event.preventDefault(); if (current && !$('save').disabled) await save(); } }));
-setInterval(() => { if (token && !$('workspace').hidden) refresh().catch(() => {}); }, 2500);
 if (token) run(connect)(); else $('login').hidden = false;

@@ -104,17 +104,17 @@ def main():
         if failure:
             sys.exit(failure)
         if corrector:
-            print("Loading the local correction model...", flush=True)
-            # A multi-gigabyte text model loads slowly from a bind-mounted folder.
-            failure = wait_for(corrector, "correction", corrector_process, data / "corrector.log", 900)
-            if failure:
-                # Transcription is the core feature; AI correction is optional.
-                print(f"{failure}\nContinuing without AI correction.", flush=True)
-                corrector = None
+            # Transcription is the core feature, so never make the app wait for the
+            # multi-gigabyte text model: it finishes loading while notes are read.
+            def await_corrector(client=corrector, child=corrector_process):
+                failure = wait_for(client, "correction", child, data / "corrector.log", 900)
+                print(f"{failure}\nContinuing without AI correction." if failure
+                      else f"AI correction is now ready ({client.model}).", flush=True)
+            threading.Thread(target=await_corrector, daemon=True, name="corrector-load").start()
         app = create_app(data, engine, token, corrector)
         url = f"http://127.0.0.1:{args.port}/#token={token}"
         print(f"\nLocalScribe: {url}\nAccess code: {token}", flush=True)
-        print(f"AI correction: {'ready (' + corrector.model + ')' if corrector else 'off'}", flush=True)
+        print(f"AI correction: {'still loading in the background (' + corrector.model + ')' if corrector else 'off'}", flush=True)
         print("Ctrl+C stops the app and the local models.\n", flush=True)
         if args.lan:
             print(f"Phone: open http://YOUR-PC-LAN-IP:{args.port} and enter the code above.", flush=True)

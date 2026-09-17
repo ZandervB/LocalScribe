@@ -22,6 +22,7 @@ import warnings
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from PIL import Image, ImageOps, UnidentifiedImageError
 import pymupdf
 from pydantic import BaseModel, Field
@@ -35,6 +36,7 @@ Image.MAX_IMAGE_PIXELS = 25_000_000
 FORMATS = {"JPEG": (".jpg", "image/jpeg"), "PNG": (".png", "image/png"), "WEBP": (".webp", "image/webp")}
 CORRECTOR_SECTION_CHARS = 4500
 CORRECTOR_CONTEXT_CHARS = 9000
+READY_CACHE_SECONDS = 3.0
 
 
 def now():
@@ -83,6 +85,7 @@ class Store:
             for column, statement in migrations.items():
                 if column not in columns:
                     db.execute(statement)
+            db.execute("CREATE INDEX IF NOT EXISTS notes_document ON notes(document_id, page_number)")
             db.execute("UPDATE notes SET status='error', error='Processing was interrupted. You can retry.' WHERE status IN ('queued','running')")
             db.execute("""UPDATE notes SET enhance_status='error',
                 enhance_error='AI correction was interrupted. You can run it again.'
@@ -207,14 +210,21 @@ class ChatClient:
         self.headers = {"Authorization": "Bearer " + key} if key else {}
         self.client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.log = log
+        self.ready_until = 0.0
 
     def ready(self):
+        # Only a positive answer is cached, so startup still polls at full speed.
+        if time.monotonic() < self.ready_until:
+            return True
         try:
             request = urllib.request.Request(self.url + "/health", headers=self.headers)
             with self.client.open(request, timeout=2) as response:
-                return response.status == 200
+                healthy = response.status == 200
         except (OSError, urllib.error.URLError):
             return False
+        if healthy:
+            self.ready_until = time.monotonic() + READY_CACHE_SECONDS
+        return healthy
 
     def complete(self, messages, max_tokens, logprobs=False):
         payload = {"messages": messages, "temperature": 0, "max_tokens": max_tokens, "stream": False}
@@ -542,7 +552,7 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None):
                 with segmented_inputs(store.files / f"{note_id}.preview.jpg", bool(note["segment"])) as inputs:
                     for index, item in enumerate(inputs, start=1):
                         segment_text, segment_truncated, scored = engine.transcribe(item["path"])
-                        start_offset = sum(len(output) + 2 for output in outputs)
+                        start_offset = sum(len(output) + 1 for output in outputs)
                         outputs.append(segment_text)
                         regions.append({"index": index, "top": item["top"], "bottom": item["bottom"],
                                         "start": start_offset, "end": start_offset + len(segment_text),
@@ -556,7 +566,8 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None):
                             row = segment_text.count("\n", 0, span["start"])
                             uncertain.append({**span, "start": span["start"] + start_offset,
                                               "end": span["end"] + start_offset, "line": rows.get(row)})
-                text = "\n\n".join(outputs)
+                # A segment boundary is a place the page was cut, not a paragraph break.
+                text = "\n".join(outputs)
                 with store.connect() as db:
                     db.execute("""UPDATE notes SET status='ready', raw_text=?, text=?,
                         seconds=?, truncated=?, regions=?, uncertain=?, lines=?,
@@ -584,9 +595,16 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None):
     app = FastAPI(title="LocalScribe", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.token = store, token
 
+    expected = ("Bearer " + token).encode("utf-8")
+
     def authorize(request: Request):
+        # Headers reach us latin-1 decoded, so compare the bytes a client actually sent.
         supplied = request.headers.get("authorization", "")
-        if not secrets.compare_digest(supplied, "Bearer " + token):
+        try:
+            candidate = supplied.encode("latin-1")
+        except UnicodeEncodeError:
+            candidate = supplied.encode("utf-8")
+        if not secrets.compare_digest(candidate, expected):
             raise HTTPException(401, "Enter the access code shown in the LocalScribe terminal.")
 
     @app.middleware("http")
@@ -595,7 +613,7 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Cache-Control"] = "no-store"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' blob:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action 'self'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' blob:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
         return response
 
     @app.get("/")
@@ -618,7 +636,7 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None):
     def list_notes(q: str = ""):
         with store.connect() as db:
             rows = db.execute("""SELECT id,title,created,status,reviewed,seconds,error,truncated,
-                document_id,document_title,page_number,
+                document_id,document_title,page_number,enhance_status,
                 substr(text,1,160) AS excerpt FROM notes
                 WHERE instr(lower(title),lower(?)) OR instr(lower(text),lower(?))
                 ORDER BY created DESC LIMIT 200""", (q[:200], q[:200])).fetchall()
@@ -634,13 +652,14 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None):
         if is_pdf:
             if len(content) > MAX_PDF_UPLOAD:
                 raise HTTPException(413, "Please use a PDF smaller than 50 MB.")
-            notes = store.add_pdf(content, file.filename or "Imported PDF", segment)
+            # Rendering pages is seconds of CPU work; keep it off the event loop.
+            notes = await run_in_threadpool(store.add_pdf, content, file.filename or "Imported PDF", segment)
             for note in notes:
                 jobs.put(("ocr", note["id"]))
             return {"notes": notes}
         if len(content) > MAX_UPLOAD:
             raise HTTPException(413, "Please use an image smaller than 15 MB.")
-        note = store.add(content, file.filename or "Untitled note", segment)
+        note = await run_in_threadpool(store.add, content, file.filename or "Untitled note", segment)
         jobs.put(("ocr", note["id"]))
         return note
 
