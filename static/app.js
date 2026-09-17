@@ -4,7 +4,7 @@ if (location.hash) history.replaceState(null, '', location.pathname);
 let current = null, dirty = false, imageURL = null, selection = 0, saving = false, uploading = false;
 let listItems = [], toastTimer, searchTimer, grouping = false, groupSelection = [];
 let aiView = 'edit', correctorReady = false, correctorModel = 'a local language model';
-let comparedKey = '', lastEnhanceStatus = new Map();
+let comparedKey = '', lastEnhanceStatus = new Map(), askedForFix = new Set();
 let uncertainSpans = [], locatedSpans = [], pageLines = [], focused = -1, showUncertain = true;
 const states = {queued: 'In queue', running: 'Transcribing', ready: 'Needs review', error: 'Needs attention', cancelled: 'Cancelled'};
 const BUSY = ['queued', 'running'];
@@ -91,7 +91,7 @@ function noteButton(note) {
       const cancel = document.createElement('button'); cancel.textContent = 'Cancel'; cancel.title = 'Cancel queued transcription';
       cancel.onclick = run(() => cancelNote(note)); actions.append(cancel);
     }
-    if (note.status !== 'running' && note.enhance_status !== 'running') {
+    if (note.status !== 'running') {
       const remove = document.createElement('button'); remove.textContent = 'Delete'; remove.className = 'delete-link'; remove.title = 'Delete note';
       remove.onclick = run(() => deleteNote(note)); actions.append(remove);
     }
@@ -168,6 +168,9 @@ function matchBackdrop() {
 }
 function paintBackdrop() {
   const backdrop = $('highlight-backdrop'), editor = $('transcript'), value = editor.value;
+  // On another tab the editor has no layout, and measuring it would collapse every
+  // shaded word to zero width. Leave the last good paint until the tab returns.
+  if (!editor.clientWidth) return;
   if (!showUncertain || !locatedSpans.length) { backdrop.replaceChildren(); return; }
   matchBackdrop();
   const fragment = document.createDocumentFragment();
@@ -227,7 +230,7 @@ function refreshUncertainty() {
     const word = document.createElement('span'); word.textContent = span.text;
     const score = document.createElement('small'); score.textContent = `${Math.round(span.p * 100)}%`;
     button.append(word, score);
-    button.onclick = () => focusUncertain(index);
+    button.onclick = () => { setView('edit'); focusUncertain(index); };
     return button;
   }));
   for (const id of ['previous-uncertain', 'next-uncertain']) $(id).disabled = !locatedSpans.length;
@@ -328,8 +331,9 @@ function setView(view) {
     $(panel).hidden = !active;
   }
   $('ai-apply').hidden = view === 'edit';
-  // scrollHeight is 0 while the panel is hidden, so size the editor once it is shown.
-  if (view === 'edit') autoGrow();
+  // scrollHeight and clientWidth are 0 while the panel is hidden, so measure and
+  // repaint only once it is shown.
+  if (view === 'edit') { autoGrow(); paintBackdrop(); paintBands(); }
   if (view === 'ai') $('corrected-text').textContent = current.enhanced_text;
   if (view === 'compare') renderComparison();
 }
@@ -344,7 +348,7 @@ function renderEnhancement(note) {
   let message = '';
   if (!usable) message = '';
   else if (!correctorReady) message = 'The local correction model is not running, so AI correction is unavailable.';
-  else if (note.enhance_status === 'queued') message = 'Waiting in the local queue…';
+  else if (note.enhance_status === 'queued') message = 'AI correction is waiting in the local queue…';
   else if (note.enhance_status === 'running') message = `${correctorModel} is reading the whole transcription…`;
   else if (available) message = `${correctorModel} reviewed the full page transcription. Compare it before using it.`;
   $('ai-status').textContent = message; $('ai-status').hidden = !message;
@@ -352,7 +356,9 @@ function renderEnhancement(note) {
   $('ai-failure').textContent = note.enhance_error || '';
   const previous = lastEnhanceStatus.get(note.id);
   lastEnhanceStatus.set(note.id, note.enhance_status);
-  setView(available && ['queued','running'].includes(previous) && note.enhance_status === 'ready' ? 'compare' : aiView);
+  const arrived = available && ['queued','running'].includes(previous) && note.enhance_status === 'ready';
+  // Automatic corrections must not pull the reader off their own text.
+  setView(arrived && askedForFix.delete(note.id) ? 'compare' : aiView);
 }
 function renderNote(note, updateText = true) {
   if (current?.id !== note.id) { aiView = 'edit'; comparedKey = ''; focused = -1; }
@@ -534,6 +540,7 @@ $('document-form').onsubmit = run(async event => {
 $('cancel-job').onclick = run(async () => cancelNote(current));
 $('retry').onclick = run(async () => { await api('/api/notes/' + current.id + '/retry', {method:'POST'}); await refresh(); });
 $('enhance-text').onclick = run(async () => {
+  askedForFix.add(current.id);
   await api(`/api/notes/${current.id}/enhance`, {method:'POST'});
   await refresh(); toast('Local AI correction queued. It reads the whole page transcription.');
 });

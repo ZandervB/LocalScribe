@@ -46,6 +46,9 @@ def main():
                         default=ROOT / "models" / (os.environ.get("LOCALSCRIBE_CORRECTOR_MODEL") or CORRECTOR_FILE))
     parser.add_argument("--no-corrector", action="store_true", help="Skip the text model used for AI correction")
     parser.add_argument("--threads", type=int, default=min(4, os.cpu_count() or 2))
+    parser.add_argument("--engine-context", type=int,
+                        default=int(os.environ.get("LOCALSCRIBE_ENGINE_CONTEXT", "6144")),
+                        help="Token context for the handwriting model; a 1400px page costs about 1500")
     parser.add_argument("--gpu-layers", type=int, default=int(os.environ.get("LOCALSCRIBE_GPU_LAYERS", "0")),
                         help="Number of model layers to offload; 0 forces CPU")
     parser.add_argument("--mmproj-offload", action=argparse.BooleanOptionalAction,
@@ -56,6 +59,8 @@ def main():
         parser.error("--threads must be positive")
     if args.gpu_layers < 0:
         parser.error("--gpu-layers cannot be negative")
+    if args.engine_context < 2048:
+        parser.error("--engine-context must be at least 2048")
     token = os.environ.get("LOCALSCRIBE_TOKEN") or secrets.token_urlsafe(24)
     data = ROOT / "data"
     data.mkdir(exist_ok=True)
@@ -79,7 +84,7 @@ def main():
             log = (data / "engine.log").open("w", encoding="utf-8")
             logs.append(log)
             command = [str(binary), "-m", str(model), "--mmproj", str(projector),
-                       "--host", "127.0.0.1", "--port", str(engine_port), "-c", "8192",
+                       "--host", "127.0.0.1", "--port", str(engine_port), "-c", str(args.engine_context),
                        "-t", str(args.threads), "-ngl", str(args.gpu_layers), "--parallel", "1",
                        "--no-webui", "--api-key", engine_key]
             if not args.mmproj_offload:

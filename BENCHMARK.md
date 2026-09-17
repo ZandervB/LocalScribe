@@ -223,6 +223,150 @@ continues. Segments now join with `
 offsets were corrected from +2 to +1 to match. A test asserts every stored offset
 still slices back to its own recorded text.
 
+## Where OCR time actually goes (17 September 2026)
+
+Read from `data/engine.log` of the running container, transcribing the user's ruled
+page on four threads.
+
+| | Segment 1 | Segment 2 |
+| --- | ---: | ---: |
+| Prompt eval (the page image) | 36.5 s / 761 tokens | 31.4 s / 700 tokens |
+| Generation (the transcript) | 10.3 s / 259 tokens | 0.9 s / 27 tokens |
+| Total | 46.7 s | 32.3 s |
+| Share spent encoding the image | 78% | **97%** |
+
+**Roughly 85% of transcription time is encoding the page image, not writing text.**
+That makes pixel count, not output length, the variable worth attacking. From these
+figures the image costs about **1003 prompt tokens per megapixel**.
+
+Segment 2 is the clearest waste: **31.4 seconds encoding a photograph of a desk**,
+returning 27 tokens, on the same page framing that also cost a whole paragraph of
+transcription.
+
+### Threads
+
+Ten IAM lines, identical settings, only `--threads` varied:
+
+| Threads | Mean CER | Mean WER | Mean time/line |
+| ---: | ---: | ---: | ---: |
+| 4 | 0.004 | 0.033 | 14.0 s |
+| 8 | 0.004 | 0.033 | **10.8 s** |
+
+**1.30x faster, byte-identical output** (expected: temperature is 0). This is a lower
+bound for full pages: IAM lines are small, so per-call overhead dominates them,
+whereas a page spends most of its time in compute-bound prompt eval. `LOCALSCRIBE_CPUS`,
+`LOCALSCRIBE_THREADS` and `LOCALSCRIBE_MEMORY` are now configurable, defaults unchanged
+at 4/4/9g so the documented 16 GB target still holds.
+
+### Trimming a dark surround from the page
+
+The earlier attempt to find the page as the largest bright region was rejected because
+it cropped clean scans to 10-33% of themselves. `trim_background` instead removes only
+**leading and trailing edge runs** that are far darker than the paper, which cannot
+misfire on a page that already fills the frame.
+
+| Input | Result |
+| --- | --- |
+| Ruled page on a dark desk | Trimmed to y 0.00-0.79, removing **22% of the frame** |
+| Six clean scanned pages (`pdf-import-qa`) | **No crop on any of them** |
+| Synthetic full-white and full-dark frames | No crop |
+
+On the real page, end to end through `Store.add`: 899x1599 -> 899x1255, and detected
+ink bands **2 -> 16** with the tallest blob 0.215 -> 0.183 of page height. The page
+still has ~19 lines of writing, so line detection remains imperfect; it is no longer
+collapsing whole paragraphs into one band.
+
+### Inference resolution and context
+
+The recognition copy is now capped at **1400 px** on its longest side rather than 2000.
+For a 12 MP phone photo that is 1.47 MP instead of 3.00 MP, about **49% of the pixels**
+and therefore about half the image tokens. The cap did not bind on the ruled page above,
+whose recognition copy is only 1255 px tall, so its gain came entirely from the trim.
+
+Engine context dropped 8192 -> **6144**, sized from the measured 1003 tokens/MP:
+
+| Case | Image tokens | + 2048 output | Fits 4096 | Fits 6144 |
+| --- | ---: | ---: | :---: | :---: |
+| Segment at the 1400 cap | 702 | 2750 | yes | yes |
+| Whole page, segmentation off, 1400 cap | 1474 | 3522 | yes | yes |
+| Whole page, segmentation off, old 2000 cap | 3009 | 5057 | **no** | yes |
+
+4096 was rejected: it would overflow a non-segmented page at the old cap, leaving no
+margin if the cap is ever raised again. The corrector keeps 8192 — its prompt reaches
+roughly 4000 tokens plus up to 2850 of output.
+
+**Not yet measured: whether the 1400 px cap costs accuracy.** IAM's line crops cannot
+answer it and no user page has a verified reference transcript. This is the one change
+here shipped on reasoning rather than a measurement.
+
+## Rebuilt container, verified end to end (17 September 2026)
+
+Image rebuilt and `smoke_check.py` run against the real model inside it. The check
+**passed**: access control, real transcription, editing, raw-text preservation,
+original download, search and text export.
+
+Applied limits confirmed by `docker inspect`: `NanoCpus=8000000000`, `Memory=16 GiB`.
+Engine flags confirmed from `/proc`: `-c 6144 -t 8`.
+
+| Darwin letter, 624 x 1008, in Docker | Wall time |
+| --- | ---: |
+| Earlier run, 4 threads | 52.9 s |
+| This run, 8 threads | **39.2 s** |
+
+A clean attribution: the image is 0.63 MP, so the new 1400 px cap did not bind, and
+`trim_background` correctly returned `None` for it — the stored recognition copy is
+624 x 1008, byte-for-byte the original size. The context reduction does not affect
+inference speed. The difference is therefore the thread count: **1.35x**, consistent
+with the 1.30x measured on the IAM set.
+
+Sampling `docker stats` during a transcription showed **790-809% of the 800% allocated**,
+confirming the vision encoder does use every allocated core. This had been in doubt
+because prompt-eval throughput per token looked flat between the two thread counts;
+that comparison was across different images and is not meaningful.
+
+One measurement to discard: re-running the *same* image transcribed in 5.1 s rather
+than 39.2 s. That is llama.cpp reusing the KV cache for an identical prompt, not a
+speedup for new pages.
+
+The startup change is visible in the log: the banner prints
+`AI correction: still loading in the background` and the app is reachable while the
+2.5 GB corrector is still loading.
+
+## Automatic correction, and three things it broke (17 September 2026)
+
+Correction is now queued by the worker as soon as a page transcribes, controlled by
+`LOCALSCRIBE_AUTO_CORRECT` (default on). Because the queue is FIFO and correction jobs
+are appended, **every queued page is transcribed before any correction runs**, so a
+50-page import still gets all its text first.
+
+`NEXT_AI.md` item 12 says the correction must never be applied silently. That holds:
+automatic or not, the result only lands in `enhanced_text` and is shown as a diff.
+
+Three consequences found and fixed while implementing it:
+
+1. **Delete was blocked for the length of every correction.** `delete_note` refused
+   while `enhance_status='running'`. That was tolerable when a human pressed the
+   button; with automatic correction it locked Delete for 30-60 s on every page for a
+   job nobody asked for. Only transcription holds the page files open — the corrector
+   is text-only and reads `raw_text` from the database — so deletion is now allowed
+   during correction. This first showed up as a test failing roughly 1 run in 6.
+2. **The view jumped to Compare on its own.** The UI switched tabs when a correction
+   the reader was waiting on completed. Automatic corrections would have pulled every
+   reader off their own text. The switch is now gated on `askedForFix`, so it only
+   follows a button press.
+3. **Queue copy** said "Waiting in the local queue", which read as though the reader
+   had asked for it.
+
+### A separate UI bug, reported from the browser
+
+Clicking an uncertain word while the **Compare** tab was open, then returning to
+**Your text**, left every shaded word collapsed to a sliver at the left of its line.
+`matchBackdrop` sets the shading layer's width from `editor.clientWidth`, which is
+**0** while the edit tab is hidden, so the layer was painted at zero width and nothing
+repainted it on return. `paintBackdrop` now refuses to measure a hidden editor,
+`setView('edit')` repaints once the tab is on screen, and an uncertain-word chip
+switches to the edit tab before focusing, since chips are visible on every tab.
+
 ## Startup and interface (17 September 2026)
 
 - **The app no longer waits for the correction model.** `run.py` blocked on

@@ -12,8 +12,9 @@ from fastapi.testclient import TestClient
 from PIL import Image
 import pymupdf
 
-from app import (clean_correction, corrector_sections, create_app, line_bands, LocalEngine,
-                 map_lines_to_bands, refit_lines, Store, strip_preamble, TextCorrector, uncertain_spans)
+from app import (clean_correction, corrector_sections, create_app, INFERENCE_PIXELS, line_bands,
+                 LocalEngine, map_lines_to_bands, refit_lines, Store, strip_preamble, TextCorrector,
+                 trim_background, uncertain_spans)
 
 
 class FakeEngine:
@@ -193,6 +194,11 @@ class NotebookTests(unittest.TestCase):
         self.assertEqual(exported.status_code, 200)
         self.assertIn("--- Page 1 ---", exported.text)
         self.assertIn("--- Page 2 ---", exported.text)
+        # The sidebar groups purely from these three columns of the list response.
+        listed = sorted(self.client.get("/api/notes").json(), key=lambda row: row["page_number"])
+        self.assertEqual({row["document_id"] for row in listed}, {notes[0]["document_id"]})
+        self.assertEqual([row["document_title"] for row in listed], ["journal", "journal"])
+        self.assertEqual([row["page_number"] for row in listed], [1, 2])
 
     def test_dense_portrait_page_is_segmented_in_reading_order(self):
         stream = BytesIO()
@@ -296,10 +302,33 @@ class NotebookTests(unittest.TestCase):
         self.assertTrue(all(not path.exists() for path in paths))
         self.assertTrue(all(self.client.get(f"/api/notes/{page['id']}").status_code == 404 for page in pages))
 
+    def test_correction_is_queued_automatically_once_transcription_finishes(self):
+        original = self.wait(self.upload())
+        enhanced = self.wait_enhancement(original["id"])
+        self.assertEqual(enhanced["enhance_status"], "ready")
+        self.assertIn("June", enhanced["enhanced_text"])
+        # Automatic or not, the correction is never written into the editable text.
+        self.assertEqual(enhanced["text"], original["text"])
+        self.assertEqual(enhanced["raw_text"], original["raw_text"])
+        self.assertEqual(self.corrector.drafts, [original["raw_text"]])
+
+    def test_automatic_correction_can_be_switched_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            corrector = FakeCorrector()
+            app = create_app(directory, FakeEngine(), "test-secret", corrector, auto_correct=False)
+            with TestClient(app, headers={"Authorization": "Bearer test-secret"}) as client:
+                note = client.post("/api/notes", files={"file": ("n.png", self.image, "image/png")}).json()
+                end = time.monotonic() + 5
+                while time.monotonic() < end and client.get("/api/notes/" + note["id"]).json()["status"] != "ready":
+                    time.sleep(0.01)
+                time.sleep(0.3)
+                after = client.get("/api/notes/" + note["id"]).json()
+                self.assertEqual(after["enhance_status"], "idle")
+                self.assertEqual(corrector.drafts, [])
+                self.assertEqual(client.post(f"/api/notes/{note['id']}/enhance").status_code, 202)
+
     def test_ai_enhancement_is_separate_and_preserves_original_ocr(self):
         original = self.wait(self.upload())
-        response = self.client.post(f"/api/notes/{original['id']}/enhance")
-        self.assertEqual(response.status_code, 202, response.text)
         enhanced = self.wait_enhancement(original["id"])
         self.assertEqual(enhanced["enhance_status"], "ready")
         self.assertEqual(enhanced["raw_text"], original["raw_text"])
@@ -439,10 +468,32 @@ class NotebookTests(unittest.TestCase):
     def test_note_list_reports_correction_state_for_the_sidebar(self):
         note_id = self.upload()
         self.wait(note_id)
-        self.assertEqual(self.client.post("/api/notes/" + note_id + "/enhance").status_code, 202)
         self.wait_enhancement(note_id)
         row = next(item for item in self.client.get("/api/notes").json() if item["id"] == note_id)
         self.assertEqual(row["enhance_status"], "ready")
+
+    def test_desk_around_a_photographed_page_is_trimmed_but_a_full_scan_is_not(self):
+        photo = Image.new("RGB", (400, 600), (40, 35, 30))
+        photo.paste(Image.new("RGB", (360, 400), "white"), (20, 40))
+        left, top, right, bottom = trim_background(photo)
+        self.assertLess(top, 60)
+        self.assertGreater(bottom, 400)
+        self.assertLess(bottom, 520)
+        self.assertLess(right - left, 400)
+        scan = Image.new("RGB", (400, 600), "white")
+        for row in range(40, 560, 40):
+            scan.paste(Image.new("RGB", (360, 12), (30, 30, 30)), (20, row))
+        self.assertIsNone(trim_background(scan), "a page-to-edge scan must never be cropped")
+        self.assertIsNone(trim_background(Image.new("RGB", (400, 600), (12, 12, 12))))
+
+    def test_inference_copy_is_bounded_and_the_original_is_untouched(self):
+        stream = BytesIO()
+        Image.new("RGB", (3000, 2400), "white").save(stream, format="PNG")
+        note = self.app.state.store.add(stream.getvalue(), "big.png")
+        with Image.open(self.app.state.store.files / (note["id"] + ".preview.jpg")) as preview:
+            self.assertEqual(max(preview.size), INFERENCE_PIXELS)
+        with Image.open(self.app.state.store.files / note["original"]) as original:
+            self.assertEqual(original.size, (3000, 2400))
 
     def test_correction_model_may_still_be_loading_when_the_app_starts(self):
         self.corrector.ready = lambda: False

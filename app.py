@@ -37,10 +37,44 @@ FORMATS = {"JPEG": (".jpg", "image/jpeg"), "PNG": (".png", "image/png"), "WEBP":
 CORRECTOR_SECTION_CHARS = 4500
 CORRECTOR_CONTEXT_CHARS = 9000
 READY_CACHE_SECONDS = 3.0
+INFERENCE_PIXELS = 1400
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def trim_background(image, probe=200, darkness=0.55, keep_at_least=0.45):
+    """Box of the page inside a photograph that also caught the desk it lay on.
+
+    Only leading and trailing edge runs are considered, and only where they are far
+    darker than the paper itself, so a scan that is page edge to edge is never cut.
+    Returns pixel bounds, or None when nothing should be removed.
+    """
+    small = image.convert("L").resize((probe, probe), Image.Resampling.BOX)
+    pixels = small.tobytes()
+    rows = [sum(pixels[y * probe:(y + 1) * probe]) / probe for y in range(probe)]
+    columns = [sum(pixels[y * probe + x] for y in range(probe)) / probe for x in range(probe)]
+    paper = sorted(rows)[int(0.85 * (probe - 1))]
+    if paper < 40:
+        return None
+    cut = paper * darkness
+
+    def edges(values):
+        first, last = 0, len(values) - 1
+        while first < last and values[first] < cut:
+            first += 1
+        while last > first and values[last] < cut:
+            last -= 1
+        return first, last + 1
+
+    top, bottom = edges(rows)
+    left, right = edges(columns)
+    kept = (bottom - top) * (right - left) / (probe * probe)
+    if kept > 0.999 or kept < keep_at_least:
+        return None
+    return (round(left / probe * image.width), round(top / probe * image.height),
+            round(right / probe * image.width), round(bottom / probe * image.height))
 
 
 class Store:
@@ -131,7 +165,10 @@ class Store:
                     else:
                         preview = oriented.convert("RGB")
                     # Keep the full-resolution original. Bound only the inference copy.
-                    preview.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
+                    box = trim_background(preview)
+                    if box:
+                        preview = preview.crop(box)
+                    preview.thumbnail((INFERENCE_PIXELS, INFERENCE_PIXELS), Image.Resampling.LANCZOS)
         except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
             raise HTTPException(400, "Use a readable JPEG, PNG, or WebP image under 25 megapixels.") from exc
         note_id = uuid.uuid4().hex
@@ -512,7 +549,9 @@ class DocumentCreate(BaseModel):
     document_id: str | None = None
 
 
-def create_app(data_dir=None, engine=None, token=None, corrector=None):
+def create_app(data_dir=None, engine=None, token=None, corrector=None, auto_correct=None):
+    if auto_correct is None:
+        auto_correct = os.environ.get("LOCALSCRIBE_AUTO_CORRECT", "1") == "1"
     store = Store(data_dir or ROOT / "data")
     engine = engine or LocalEngine(int(os.environ.get("LOCALSCRIBE_ENGINE_PORT", "8091")))
     token = token or os.environ.get("LOCALSCRIBE_TOKEN") or secrets.token_urlsafe(24)
@@ -526,12 +565,18 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None):
             except queue.Empty:
                 continue
             try:
-                if kind == "enhance":
+                if kind in ("enhance", "auto"):
                     with store.connect() as db:
                         claimed = db.execute("""UPDATE notes SET enhance_status='running',enhance_error=''
                             WHERE id=? AND enhance_status='queued'""", (note_id,))
                         if claimed.rowcount != 1:
                             continue
+                    if kind == "auto" and not (corrector and corrector.ready()):
+                        # Nobody asked for this one, so a model that is still loading is
+                        # not an error to report: leave the button for the reader.
+                        with store.connect() as db:
+                            db.execute("UPDATE notes SET enhance_status='idle' WHERE id=?", (note_id,))
+                        continue
                     note = store.get(note_id)
                     if corrector is None:
                         raise RuntimeError("The local correction model is not running. Start LocalScribe without --no-corrector to use AI correction.")
@@ -574,9 +619,15 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None):
                         reviewed=0, revision=revision+1 WHERE id=?""",
                                (text, text, time.monotonic() - start, int(truncated),
                                 json.dumps(regions), json.dumps(uncertain), json.dumps(lines), note_id))
+                if auto_correct and corrector is not None and text.strip():
+                    # Appending keeps every queued page's transcription ahead of any correction.
+                    with store.connect() as db:
+                        db.execute("""UPDATE notes SET enhance_status='queued',enhance_error='',
+                            enhanced_text='' WHERE id=? AND enhance_status!='running'""", (note_id,))
+                    jobs.put(("auto", note_id))
             except Exception as exc:
                 with store.connect() as db:
-                    if kind == "enhance":
+                    if kind in ("enhance", "auto"):
                         db.execute("UPDATE notes SET enhance_status='error',enhance_error=? WHERE id=?",
                                    (str(exc)[:500], note_id))
                     else:
@@ -742,8 +793,10 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None):
     @app.delete("/api/notes/{note_id}", status_code=204, dependencies=[Depends(authorize)])
     def delete_note(note_id: str):
         note = store.get(note_id)
-        if note["status"] == "running" or note["enhance_status"] == "running":
-            raise HTTPException(409, "Wait for the active local AI task to finish before deleting it.")
+        # Only transcription holds the page files open. Correction is text-only, so a
+        # note can be deleted while it runs - which matters now that it starts by itself.
+        if note["status"] == "running":
+            raise HTTPException(409, "Wait for the transcription to finish before deleting it.")
         with store.connect() as db:
             db.execute("DELETE FROM notes WHERE id=?", (note_id,))
         (store.files / note["original"]).unlink(missing_ok=True)
@@ -756,8 +809,8 @@ def create_app(data_dir=None, engine=None, token=None, corrector=None):
             rows = [dict(row) for row in db.execute("SELECT * FROM notes WHERE document_id=?", (document_id,))]
         if not rows:
             raise HTTPException(404, "Document not found")
-        if any(row["status"] == "running" or row["enhance_status"] == "running" for row in rows):
-            raise HTTPException(409, "Wait for active local AI tasks in this document to finish before deleting it.")
+        if any(row["status"] == "running" for row in rows):
+            raise HTTPException(409, "Wait for transcription in this document to finish before deleting it.")
         with store.connect() as db:
             db.execute("DELETE FROM notes WHERE document_id=?", (document_id,))
         for note in rows:

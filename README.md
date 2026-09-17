@@ -31,9 +31,15 @@ docker compose version
 
 `docker version` should show both Client and Server sections.
 
-For a PC with 16 GB RAM, leave room for Windows and other applications. This
-Compose service has a 9 GB memory limit and uses up to four CPU cores. Docker/WSL
-must have enough memory available for it. Allow several GB of free disk space
+For a PC with 16 GB RAM, leave room for Windows and other applications. By default
+this Compose service has a 9 GB memory limit and uses up to four CPU cores.
+Docker/WSL must have enough memory available for it.
+
+On a larger machine, raise `LOCALSCRIBE_CPUS`, `LOCALSCRIBE_THREADS` and
+`LOCALSCRIBE_MEMORY` together in `.env`, leaving a couple of cores and some RAM for
+Windows. Set threads to your **physical** core count, not the logical count. Measured
+on the ten-line IAM benchmark: four threads 14.0 s/line, eight threads 10.8 s/line,
+with byte-identical output. Allow several GB of free disk space
 for Docker layers, approximately **3.8 GB of model downloads** (handwriting plus
 text-correction model), and your scanned pages.
 
@@ -78,10 +84,15 @@ start unless you configure `LOCALSCRIBE_TOKEN` in `.env`.
    These are the model's own per-word scores rather than a guarantee, and the
    place marked on the scan is estimated from the page layout. **Review by page
    section** and the older “worth checking” cues sit under the same panel.
-7. Optionally click **Fix with local AI** above the text. A second local model
-   reads the whole transcription and repairs recognition mistakes in it. The
-   **AI corrected** and **Compare** tabs show what changed word by word; you then
-   choose whether to put it in the editor. The original OCR is never overwritten.
+7. AI correction now starts by itself once a page finishes transcribing: a second
+   local model reads the whole transcription and repairs recognition mistakes in it.
+   It queues behind every page still waiting to be transcribed, so it never delays
+   your text. The **AI corrected** and **Compare** tabs show what changed word by
+   word; you then choose whether to put it in the editor. **The corrected text is
+   never applied for you and the original OCR is never overwritten** — automatic or
+   not, it invents words sometimes, so it stays a suggestion. Press **Fix with local
+   AI** to run it again, or set `LOCALSCRIBE_AUTO_CORRECT=0` in `.env` to run it only
+   on request.
 8. Use **Create document** to select existing notes in page order. The dialog can
    create a new document or append pages to an existing one, and its arrow buttons
    adjust page order before saving. Imported PDF pages are grouped automatically.
@@ -92,15 +103,16 @@ start unless you configure `LOCALSCRIBE_TOKEN` in `.env`.
 
 Each image is one note in this prototype. Maximum upload: 15 MB and 25 megapixels.
 The original file is preserved; an oriented copy with a maximum dimension of
-2000 pixels is used for recognition. Dense pages may work better as several
+1400 pixels is used for recognition. Dense pages may work better as several
 closer photos. Output that hits the generation limit is flagged as incomplete.
 
-**Crop the photo to the page before uploading.** LocalScribe has no page detection
-yet, so a desk, tablecloth or floor left in the frame is treated as part of the
-page. Measured on a real photo where the desk filled the bottom 22%: the ink
-threshold that locates lines was thrown off enough to merge whole paragraphs into
-one highlight band, and page segmentation spent a whole section on the desk, which
-cost an entire paragraph of transcription. Your phone's built-in crop is enough.
+**Crop the photo to the page when you can.** LocalScribe trims a dark surround
+automatically: if the edges of the photo are far darker than the paper, they are
+cut from the recognition copy. Measured on a real photo of a page on a dark desk,
+this removed 22% of the frame and took the detected lines of ink from 2 to 16.
+The trim is deliberately cautious and only removes whole dark edges, so it does
+nothing to a scan that already fills the frame, and it cannot fix a page shot at
+an angle or on a light-coloured surface. Your phone's own crop still does better.
 
 To download the optional public test examples once:
 
