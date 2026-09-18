@@ -498,6 +498,10 @@ class NotebookTests(unittest.TestCase):
         self.assertTrue(refuses_to_transcribe("### OCR - Text Analysis and Description:\nwhatever"))
         self.assertTrue(refuses_to_transcribe("\n".join(
             f"{n}. The text mentions the date of the case and the Minister." for n in range(1, 40))))
+        # The loop can also run on inside a single wrapped paragraph.
+        self.assertTrue(refuses_to_transcribe(
+            "He is an (A) group privilege since 2023.10.10 and (B) Medium Security. "
+            + "He has been granted a four months' sentence. " * 60))
         # Real pages must still pass, including ones that legitimately repeat.
         self.assertFalse(refuses_to_transcribe(
             "Registration number: 202819354\nCrimes: Assault with intent to do\nMurder x 4"))

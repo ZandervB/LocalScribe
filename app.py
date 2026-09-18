@@ -393,6 +393,8 @@ DESCRIBED = re.compile(
     r"|here is (a|the) (description|summary|analysis)"
     r")", re.IGNORECASE)
 
+SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]]?\s+|\n")
+
 
 def refuses_to_transcribe(text):
     """True when the model described the page instead of reading it back.
@@ -404,15 +406,17 @@ def refuses_to_transcribe(text):
     stripped = text.strip()
     if DESCRIBED.match(stripped):
         return True
-    lines = [line.strip() for line in stripped.splitlines() if len(line.strip()) > 15]
-    if len(lines) < 6:
+    # A loop can run inside one wrapped paragraph as easily as down a column of
+    # lines, so sentences are compared, not lines.
+    units = [unit.strip() for unit in SENTENCE_END.split(stripped) if len(unit.strip()) > 15]
+    if len(units) < 6:
         return False
     shapes = {}
-    for line in lines:
+    for unit in units:
         # Numbered list items differ only by their number, so compare without digits.
-        shapes[re.sub(r"\d+", "#", line)] = shapes.get(re.sub(r"\d+", "#", line), 0) + 1
+        shapes[re.sub(r"\d+", "#", unit)] = shapes.get(re.sub(r"\d+", "#", unit), 0) + 1
     repeats = max(shapes.values())
-    return repeats >= 5 and repeats / len(lines) > 0.4
+    return repeats >= 5 and repeats / len(units) > 0.4
 
 
 UNCERTAIN_PROBABILITY = 0.65
